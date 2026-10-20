@@ -5,7 +5,7 @@ merge/png/t3_to_t5_portraits (Tekken5-Tekken3-Merge).
   inner area (x 10..46, y 7..48), over a dark backdrop like the original icons.
 - Loading / select portrait: 456 x 448, 8-bit TIM2 with transparent background like files
   187.. (Typ 42); the figure from the head down, head near the top edge, P1 version facing
-  right at the left edge, P2 version mirrored at the right edge.
+  right at the left edge (P2 uses the same picture: the game mirrors it).
 
 White backgrounds (Gun Jack, Gon, Dr. B) are removed by a flood fill of near-white from the
 image border; the 2-pixel edge band is un-matted (alpha from the distance to white).
@@ -128,6 +128,13 @@ def icon(code, frame):
     return np.clip(np.round(out), 0, 255).astype(np.uint8)
 
 
+# Characters whose face is placed like Devil Jin's portrait (file 224, user 20.10.: Ogre and
+# True Ogre were too small): face height (forehead to chin) and face centre in the 456 x 448 P1
+# picture.
+FACE_LIKE_DEVIL_JIN = {"OGR", "TOG"}
+DEVIL_JIN_FACE_H, DEVIL_JIN_FACE_C = 85, (150, 78)
+
+
 def portrait(code):
     """456 x 448 P1 portrait (figure at the left edge, transparent background)."""
     img = load(code)
@@ -135,14 +142,21 @@ def portrait(code):
     a = img[..., 3]
     ys, xs = np.nonzero(a > 8)
     top = ys.min()
-    s = (PORTRAIT[1] - 8) / (cut - top)
+    if code in FACE_LIKE_DEVIL_JIN:
+        s = DEVIL_JIN_FACE_H / (y1 - y0)
+    else:
+        s = (PORTRAIT[1] - 8) / (cut - top)
     sh, sw = img.shape[:2]
     small = resize(img, max(1, round(sw * s)), max(1, round(sh * s)))
     W, H = PORTRAIT
     out = np.zeros((H, W, 4))
-    # head top 8 px below the edge; face centre at x = 130 (Tekken 5 P1 portraits: 85..180)
-    oy = 8 - round(top * s)
-    ox = min(130 - round((x0 + x1) / 2 * s), -round(xs.min() * s))   # never a gap at the left
+    if code in FACE_LIKE_DEVIL_JIN:
+        oy = DEVIL_JIN_FACE_C[1] - round((y0 + y1) / 2 * s)
+        ox = DEVIL_JIN_FACE_C[0] - round((x0 + x1) / 2 * s)
+    else:
+        # head top 8 px below the edge; face centre at x = 130 (Tekken 5 P1 portraits: 85..180)
+        oy = 8 - round(top * s)
+        ox = min(130 - round((x0 + x1) / 2 * s), -round(xs.min() * s))   # never a gap at the left
     sy0, sx0 = max(0, -oy), max(0, -ox)
     dy0, dx0 = max(0, oy), max(0, ox)
     hh = min(H - dy0, small.shape[0] - sy0)
@@ -212,8 +226,10 @@ def main(out_dir):
         pr = p[:, ::-1].copy()
         write_png(out / f"portrait_{code}_l.png", p)
         write_png(out / f"portrait_{code}_r.png", pr)
-        for side, img in (("l", p), ("r", pr)):
-            (out / f"portrait_{code}_{side}.tim2").write_bytes(tim2_file([encode8(img, phdr)]))
+        # loading / VS screen: the game mirrors the P2 picture itself (seen 20.10.: a mirrored
+        # P2 picture showed the figure on the left of P2's half), so both sides get the P1 one
+        for side in ("l", "r"):
+            (out / f"portrait_{code}_{side}.tim2").write_bytes(tim2_file([encode8(p, phdr)]))
         both[code] = (p, pr)
         sheet.append((ic, p))
         print(code, "done")

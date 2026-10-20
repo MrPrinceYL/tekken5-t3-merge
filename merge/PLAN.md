@@ -38,16 +38,21 @@ fehlerfrei in T5. Jede Stufe erst im Spiel prüfen (headless + Bild), dann notie
   werden jetzt übernommen (`convert(common=True)`); der „zerrissene Gon-Stand“ kam von der
   fehlenden Größenskalierung. T3-Charakter-IDs (Tabelle 0x800958C4, Wert = m + 6): Ogre 14,
   Gun Jack 16, Gon 17, Dr. B 19, True Ogre 20.
-- [ ] **P3 Füße verbuggt** (Nutzer 13.10.) – Ursache finden (Skinning/Retargeting/geteilte Ressource).
 - [ ] **P4 True Ogre Schlangenhand + Schwanz bewegt** (Sekundärbewegung FUN_80037cbc als Animation).
 - [ ] **P5 Moveset 1:1 Rest:** übrige T3-Requirements/bedingte Ketten, Intros, Reaktionen ohne
       Paar, gemeinsames T3-Animationspaket (TOC 279, Gon-Stand zerriss den Körper).
 - [ ] **P6 Stimmen:** T3-VAB `0x60+4m` → T5-Voiceclips.
 - [ ] **P7 Rest-UI:** Namensanzeige im Kampf, übrige 0x21-Grenzen (Ranglisten, Speicherstand, Endings).
-- [ ] **P8 Charakterbilder Ogre / True Ogre (Nutzer 20.10., niedrige Priorität):** große
-      Auswahlbilder zu klein – Gesicht auf Höhe und Größe von Devil Jins Bild verschieben und
-      skalieren (Devil Jin = Vorlage). Außerdem stehen die P2-Bilder auf der falschen Seite
-      (links statt rechts). Werkzeug `tools/t5_portraits.py`, Quellen `merge/png/t3_to_t5_portraits`.
+- [x] **P8 Charakterbilder Ogre / True Ogre (Nutzer 20.10.):** Gesicht wie Devil Jins Bild
+      (Datei 224: Stirn–Kinn 85 px, Mitte (150, 78) im 456×448-Bild), `t5_portraits.py`
+      `FACE_LIKE_DEVIL_JIN`. P2-Seite: das Spiel spiegelt das P2-Bild im Lade-/VS-Bildschirm
+      selbst (Test mit rot getöntem R-Bild: Tabelle 0x47B478 → id 44 wird gezeigt, aber
+      gespiegelt) → beide Seiten bekommen das P1-Bild; VS-Bildschirm geprüft (Gon P1 links,
+      Ogre P2 rechts, beide zur Mitte). Offen: große Auswahlbilder (Datei 82) für P2 im
+      Zweispieler-Auswahlbildschirm ungeprüft (headless/Skript nur Pad 1).
+- [ ] **P3 Füße (Stand 20.10.):** Werkzeug-Vorschau korrekt; im Spiel wirken Gun Jacks Stiefel
+      teils verdreht (Rundenbeginn). Nutzer fragen, ob es nach dem TOC-Fix (Kostüm-Unter-
+      dateien) noch auftritt und wo genau.
 
 ### Testablauf (20.10.)
 
