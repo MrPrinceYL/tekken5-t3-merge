@@ -77,6 +77,19 @@ fehlerfrei in T5. Jede Stufe erst im Spiel prüfen (headless + Bild), dann notie
       Offen: T3 req 28 = Whiff (keine T5-ID gefunden; Gon 6 Moves), req 24/51/55, cond
       17/20/90/84/15 (True-Ogre-Sachen?), Bewegungseingaben (Gun Jack 6, Dr. B 2), restliche
       from_unported; Schadensskala T3 ↔ T5-Lebenspunkte prüfen.
+      **T3 `cond` geklärt (FUN_8002de24, 21.10.):** Figuren-Bedingung, nicht Gegnerzustand:
+      0 immer, 1–23 eigene Figur = cond−1, 24–46 ≠ cond−24, 47–69 Gegner = cond−47 (statisch
+      unbekannt → weg), 70–92 Modell-Figur = cond−70, 93+ ≠ cond−93. T3-Figuren-IDs (Tabelle
+      0x800958C4): Ogre 14, Gun Jack 16, Gon 17, Dr. B 19, True Ogre 20. Damit: 107 = „nicht Ogre“
+      (bisher fälschlich „immer“), 90 = nur True Ogre, 84/15 = nur Ogre, 17 = nur Gun Jack.
+      Ogre/True Ogre bekommen so aus dem identischen Paket ihre eigenen Moves (`cond_ok`). Die
+      gelernte „cond 1/2/3/4/… = immer“-Regel war falsch (Moves anderer Figuren) und ist raus.
+      Befehlswürfe: jeder T3-Wurf eines Zustands außer 1+3/2+4 → eigener Versuch (Vorlage
+      Pauls 1+3-Versuch, T3-Animation/Aktivframes, Seiten → T3-Ausführungen, fehlende Seiten
+      weg). Bedingte Folgeangriffe (Rücken, On Hit) auch für Tasten-/Richtungs-Einträge.
+      Abdeckung: Ogre 140/141, True Ogre 146/146, Gun Jack 192/212, Gon 105/149, Dr. B 188/237.
+      Zufallseingaben-Test (mit gleichzeitigen Tasten): stabil. **True Ogre 447388 Byte = nur
+      484 unter der Grenze** → als Nächstes Moveset verkleinern.
       Rest (alt): Moves hinter nicht gepaarten Zuständen (from_unported: Dr. B 53, Gun Jack 33, Gon
       26 – z. B. T3-Liegeschleifen mit Bodenangriffen: Gun Jack 35/36, Gon 114/169, Dr. B 274;
       Gon 101 nach Sprung), tastenlose Übergänge mit Richtung (Gon 25), Bedingungen

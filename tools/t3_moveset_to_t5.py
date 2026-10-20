@@ -41,13 +41,37 @@ def t5_key(t3cmd):
 
 
 REQ_END = 0x141                                        # T5 requirement list end
-# T3 cancel conditions that mean "always": 0, and 107 (all 90 cond-107 standing entries of the 15
-# characters in both games have an unconditional T5 counterpart; used on 1+2, 3+4, d/f+1+2 ...)
-FREE = (0, 107)
-# learned by tools/t3_req_learn.py (21.10.): T3 conditions / requirements whose aligned T5 entries
-# have no requirement (cond 1/2/3/4/6/8/10/18: 19..80 samples each; req 39, 57: 28 / 13 samples)
-FREE_ATTACK = FREE + (1, 2, 3, 4, 6, 8, 10, 18)
+# learned by tools/t3_req_learn.py (21.10.): T3 requirements whose aligned T5 entries have no
+# requirement (req 39, 57: 28 / 13 samples)
 REQ_NONE = (0, 39, 57)
+
+
+def t3_character(m):
+    """T3 character id of model m (table 0x800958C4: four model slots per character, m + 6)."""
+    from t3_anim import _ram
+    tab = _ram(0x800958C4, 4 * 40)
+    return next(c for c in range(40) if m + 6 in tab[4 * c:4 * c + 4])
+
+
+def cond_ok(cond, ms):
+    """A T3 cancel condition (byte +2) for the character itself, FUN_8002de24: 0 always,
+    1..23 character == cond - 1, 24..46 character != cond - 24, 47..69 opponent == cond - 47
+    (unknown here: no), 70..92 model character == cond - 70, 93.. model character != cond - 93.
+    Character (+0x16) and model character (+0x18) are the same for the five. The shared
+    groups use this for character-only moves: 107 = not Ogre, 90 = True Ogre only, 17 = Gun
+    Jack only ..."""
+    if cond == 0:
+        return True
+    ch = t3_character(ms.m)
+    if cond < 0x18:
+        return ch == cond - 1
+    if cond < 0x2F:
+        return ch != cond - 0x18
+    if cond < 0x46:
+        return False
+    if cond < 0x5D:
+        return ch == cond - 0x46
+    return ch != cond - 0x5D
 LEVEL = {1: 1, 2: 2, 3: 4, 4: 5, 6: 7}                # T3 hit level byte -> T5 (T5 has a 3)
 
 
@@ -68,7 +92,7 @@ def t3_req_variants(ms, state=0):
     out = {}
     for _, e in ms.cancels(ms.own, ms.own.move(state)[3]):
         cmd, cond, req, _, tgt, *_ = e
-        if cmd >= 0xC000 or cond not in FREE or req not in REQ_T3_T5 or not cmd & 0xF:
+        if cmd >= 0xC000 or not cond_ok(cond, ms) or req not in REQ_T3_T5 or not cmd & 0xF:
             continue
         pk, idx = ms.resolve(tgt)
         if pk is not ms.own or idx >= pk.count:
@@ -86,7 +110,7 @@ def t3_attacks(ms, state=0):
     w = ms.own.move(state)
     for _, e in ms.cancels(ms.own, w[3]):
         cmd, cond, req, _, tgt, *_ = e
-        if cmd >= 0xC000 or cond not in FREE or not cmd & 0xF:
+        if cmd >= 0xC000 or not cond_ok(cond, ms) or not cmd & 0xF:
             continue
         pk, idx = ms.resolve(tgt)
         if pk is not ms.own or idx >= pk.count:
@@ -107,7 +131,7 @@ def t3_attack_entries(ms, state):
     out = []
     for _, e in ms.cancels(ms.own, ms.own.move(state)[3]):
         cmd, cond, req, _, tgt, _, fr0, fr1, st = e
-        if (cmd >= 0xC000 or cond not in FREE_ATTACK or (req not in REQ_NONE and req not in REQ_T3_T5)
+        if (cmd >= 0xC000 or not cond_ok(cond, ms) or (req not in REQ_NONE and req not in REQ_T3_T5)
                 or not cmd & 0xF):
             continue
         pk, idx = ms.resolve(tgt)
@@ -421,7 +445,7 @@ def build(m, costume, out_dir, template_slot=0):
         for _, e in ms.cancels(ms.own, ms.own.move(t3idx)[3]):
             cmd, cond, req, _, tgt, _, fr0, fr1, st = e
             rqs = t5_reqs(req)
-            if cmd >= 0xC000 or cond not in FREE_ATTACK or rqs is None:
+            if cmd >= 0xC000 or not cond_ok(cond, ms) or rqs is None:
                 continue
             if cmd == 0x10:
                 # automatic continuation in a frame window (multi-part moves): T5 command 0;
@@ -433,25 +457,25 @@ def build(m, costume, out_dir, template_slot=0):
                         entries.append(struct.pack(CANCEL, 0, rq, child, 0,
                                                    max(fr0, 1), fr1, max(st, 1), 0))
                 continue
-            if rqs != [0]:
-                continue
             if not cmd & 0xF:
                 # direction only (held): landings, rolls, stance changes inside a move
                 a = own_move(tgt)
                 if a is not None and a[0] > 1:
                     lie = lying_template(a[0])
                     if lie is not None or not resting(a[0]):
-                        entries.append(struct.pack(CANCEL, t5_key(cmd)[0], 0,
-                                                   clone(lie if lie is not None else tmove, *a),
-                                                   0, max(fr0, 1), fr1, max(st, 1), 0))
+                        child = clone(lie if lie is not None else tmove, *a)
+                        for rq in rqs:
+                            entries.append(struct.pack(CANCEL, t5_key(cmd)[0], rq, child,
+                                                       0, max(fr0, 1), fr1, max(st, 1), 0))
                 continue
             a = t3_attack(tgt)
             if a is None:
                 continue
             k = t5_key(cmd)
             child = clone(tmpl_of.get(k, tmove), *a)
-            entries.append(struct.pack(CANCEL, k[0] | k[1] << 16 | 0x20 << 24, 0, child, 9,
-                                       fr0, fr1, st, 0))
+            for rq in rqs:
+                entries.append(struct.pack(CANCEL, k[0] | k[1] << 16 | 0x20 << 24, rq, child, 9,
+                                           fr0, fr1, st, 0))
         # T3's follow-up at the end of the animation, unless it is standing or a resting loop
         # (those stay the template's: the T5 state machine's own way back)
         nxt = own_move(struct.unpack_from("<H", b, 0x10)[0])
@@ -600,7 +624,7 @@ def build(m, costume, out_dir, template_slot=0):
         front = []
         for _, e in ms.cancels(ms.own, ms.own.move(st3)[3]):
             cmd, cond, req, _, tgt, _, fr0, fr1, st = e
-            if cmd >= 0xC000 or cmd & 0xF or cmd == 0x10 or cond not in FREE_ATTACK or req not in REQ_NONE:
+            if cmd >= 0xC000 or cmd & 0xF or cmd == 0x10 or not cond_ok(cond, ms) or req not in REQ_NONE:
                 continue
             a = own_move(tgt)
             if a is None or a[0] <= 1 or a[0] in paired_t3 or resting(a[0]):
@@ -759,6 +783,86 @@ def build(m, costume, out_dir, template_slot=0):
                     com.lists["cancel"][i] = struct.pack(CANCEL, *f)
                     n_throws += 1
 
+    # every other T3 throw of a state (command throws: u/f+1+2, d/f+2+4, character-only ones
+    # ...): a new attempt = the template's 1+3 attempt with the T3 attempt's animation and
+    # active frames; its side entries (requirement 2..5) lead to the T3 executions of that
+    # attempt, sides the T3 throw does not have are dropped
+    base_attempt = next(iter(seen_attempts), None)
+
+    def t3_sides(idx):
+        out = {}
+        for _, t in ms.cancels(ms.own, ms.own.move(idx)[3]):
+            pk2, ex = ms.resolve(t[4])
+            if pk2 is ms.own and ex + 1 < pk2.count and t[2] in (2, 3, 4, 5):
+                out.setdefault(t[2], ex)
+        return out
+
+    attempts = {}
+
+    def throw_attempt(idx):
+        if idx in attempts:
+            return attempts[idx]
+        sides = t3_sides(idx)
+        mv = com.move(base_attempt)
+        a = own_anim(idx)
+        if a is not None:
+            mv["anim"] = a
+        b3 = ms.own.move_bytes(idx)
+        mv["active_start"], mv["active_end"] = b3[0x2D], b3[0x2E]
+        out = []
+        for e in com.lists["cancel"][mv["cancel"]:]:
+            f = list(struct.unpack(CANCEL, e))
+            if f[0] == 0x8000:
+                f[4] = f[6] = ms.own.anim_frames(idx, ms.common)
+                out.append(struct.pack(CANCEL, *f))
+                break
+            side = struct.unpack_from("<H", com.lists["requirement"][f[1]])[0]
+            if side in (2, 3, 4, 5) and f[2] < n_template:
+                if side not in sides:
+                    continue
+                f[2] = throw_exec(f[2], sides[side])
+            out.append(struct.pack(CANCEL, *f))
+        mv["cancel"] = len(com.lists["cancel"])
+        com.lists["cancel"].extend(out)
+        attempts[idx] = com.add("move", com.pack_move(mv))
+        return attempts[idx]
+
+    n_cmd_throws = 0
+    if base_attempt is not None:
+        for j, st3 in pairs.items():
+            front = []
+            for _, e in ms.cancels(ms.own, ms.own.move(st3)[3]):
+                cmd, cond, req, _, tgt, _, fr0, fr1, st = e
+                rqs = t5_reqs(req)
+                if cmd >= 0xC000 or not cmd & 0xF or not cond_ok(cond, ms) or rqs is None:
+                    continue
+                key = t5_key(cmd)
+                if st3 == 0 and key in ((0, 5), (0, 10), (0x20, 5), (0x20, 10)) and req == 0:
+                    continue                                  # the template's 1+3 / 2+4
+                pk, idx = ms.resolve(tgt)
+                if pk is not ms.own or idx >= pk.count or not ms.own.move(idx)[5] & 0x4000:
+                    continue
+                if not t3_sides(idx):
+                    continue
+                at = throw_attempt(idx)
+                for rq in rqs:
+                    front.append(struct.pack(CANCEL, key[0] | key[1] << 16, rq, at, 0,
+                                             max(fr0, 1), fr1, max(st, 1), 0))
+            if front:
+                mv = com.move(j)
+                k = mv["cancel"]
+                old = []
+                while True:
+                    old.append(com.lists["cancel"][k])
+                    if struct.unpack_from("<I", com.lists["cancel"][k])[0] == 0x8000:
+                        break
+                    k += 1
+                mv["cancel"] = len(com.lists["cancel"])
+                com.lists["cancel"].extend(front + old)
+                com.lists["move"][j] = com.pack_move(mv)
+                n_cmd_throws += len(front)
+    print(f"command throws: {n_cmd_throws} entries, {len(attempts)} attempts")
+
     # win poses (template moves *_Win_A..E, *_Win_Round) -> T3 win poses; intros stay
     wins = t3_win_poses(ms, skel)
     n_wins = 0
@@ -784,6 +888,8 @@ def build(m, costume, out_dir, template_slot=0):
     with open(out / "clones.txt", "w", encoding="utf-8") as fh:
         for (tm, t3), new in sorted(clones.items(), key=lambda kv: kv[1]):
             fh.write(f"{new} T3-{t3} ({com.name(com.move(tm)['name'])})\n")
+        for t3, new in sorted(attempts.items(), key=lambda kv: kv[1]):
+            fh.write(f"{new} T3-{t3} (throw attempt)\n")
     anims = scale_to_body(m, costume, template_slot, com, anims, n_tpl, t3_anim)
     if m in GON_MODELS:
         gon_always_low(com)
