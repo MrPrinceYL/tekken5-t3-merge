@@ -451,8 +451,8 @@ def build(m, costume, out_dir, template_slot=0):
             return []
         out = []
         if is_t3_sequence(cmd):
-            a = t3_attack(tgt)
-            if a is not None:
+            a = own_move(tgt)
+            if a is not None and a[0] > 1 and not resting(a[0]) and not a[1] & 0x4000:
                 child = clone(tmove, *a)
                 out = [struct.pack(CANCEL, t5_sequence(cmd), rq, child, 7, max(fr0, 1), fr1,
                                    max(st, 1), 0) for rq in rqs]
@@ -876,8 +876,8 @@ def build(m, costume, out_dir, template_slot=0):
     # throws: T5 attempt (1+3 / 2+4) -> executions by side requirement (same ids as T3's:
     # 2 front, 3 back, 4/5 sides, parameter 1536); execution = thrower move `*_n` whose hit
     # reaction sends the opponent to the victim move `*_y`. T3: execution N, victim N+1.
-    def copy_cancels(start, length):
-        out = []
+    def copy_cancels(start, length, front=()):
+        out = list(front)
         for e in com.lists["cancel"][start:]:
             f = list(struct.unpack(CANCEL, e))
             if f[0] == 0x8000:
@@ -939,7 +939,9 @@ def build(m, costume, out_dir, template_slot=0):
             H.append(struct.pack(HITCOND, rq_, dmg or dm_, rea2 if k == hn else re_))
         mv["anim"] = a
         mv["hitcond"] = h0
-        mv["cancel"] = copy_cancels(mv["cancel"], length)
+        # the T3 execution's own continuations (multi-part throws, Gun Jack 268 -> 159 ...)
+        extra = [y for _, e in ms.cancels(ms.own, ms.own.move(ex)[3]) for y in follow_entry(e, x)]
+        mv["cancel"] = copy_cancels(mv["cancel"], length, extra)
         thrown[(x, ex)] = com.add("move", com.pack_move(mv))
         return thrown[(x, ex)]
 
@@ -972,41 +974,61 @@ def build(m, costume, out_dir, template_slot=0):
     # attempt, sides the T3 throw does not have are dropped
     base_attempt = next(iter(seen_attempts), None)
 
+    THROW_SIDES = range(2, 18)          # T3 = T5 ids: standing / crouching / face up / face down
+                                        # x front, back, left, right (T7 3..18 one higher)
+
     def t3_sides(idx):
-        out = {}
+        """[(side requirement, T3 execution)] of a T3 throw attempt, in T3 order."""
+        out = []
         for _, t in ms.cancels(ms.own, ms.own.move(idx)[3]):
             pk2, ex = ms.resolve(t[4])
-            if pk2 is ms.own and ex + 1 < pk2.count and t[2] in (2, 3, 4, 5):
-                out.setdefault(t[2], ex)
+            if (pk2 is ms.own and ex + 1 < pk2.count and t[2] in THROW_SIDES and cond_ok(t[1], ms)
+                    and t[2] not in [s for s, _ in out]):
+                out.append((t[2], ex))
         return out
 
+    def side_list(s):
+        """Requirement list index of throw side s (the template's: {s, 1536}, end)."""
+        if s not in side_lists:
+            side_lists[s] = len(com.lists["requirement"])
+            com.lists["requirement"].append(struct.pack("<HH", s, 1536))
+            com.lists["requirement"].append(struct.pack("<HH", REQ_END, 0))
+        return side_lists[s]
+
+    R2 = [struct.unpack("<HH", e) for e in com.lists["requirement"]]
+    side_lists = {R2[k][0]: k for k in range(len(R2) - 1)
+                  if R2[k][0] in THROW_SIDES and R2[k][1] == 1536 and R2[k + 1][0] == REQ_END}
     attempts = {}
 
     def throw_attempt(idx):
+        """The template's 1+3 attempt with T3 attempt idx's animation, active frames and its
+        sides: one entry per T3 side (template side entry fields), executions = template
+        execution of that side (front for the others) with the T3 execution and victim."""
         if idx in attempts:
             return attempts[idx]
-        sides = t3_sides(idx)
         mv = com.move(base_attempt)
         a = own_anim(idx)
         if a is not None:
             mv["anim"] = a
         b3 = ms.own.move_bytes(idx)
         mv["active_start"], mv["active_end"] = b3[0x2D], b3[0x2E]
-        out = []
+        out, side_tmpl, ref = [], {}, None
         for e in com.lists["cancel"][mv["cancel"]:]:
             f = list(struct.unpack(CANCEL, e))
             if f[0] == 0x8000:
                 f[4] = f[6] = ms.own.anim_frames(idx, ms.common)
-                out.append(struct.pack(CANCEL, *f))
+                end = struct.pack(CANCEL, *f)
                 break
             side = struct.unpack_from("<H", com.lists["requirement"][f[1]])[0]
-            if side in (2, 3, 4, 5) and f[2] < n_template:
-                if side not in sides:
-                    continue
-                f[2] = throw_exec(f[2], sides[side])
+            if side in THROW_SIDES and f[2] < n_template:
+                side_tmpl.setdefault(side, f[2])
+                ref = ref or f
+                continue
             out.append(struct.pack(CANCEL, *f))
+        sides = [struct.pack(CANCEL, ref[0], side_list(s), throw_exec(side_tmpl.get(s, side_tmpl.get(2)), ex),
+                             *ref[3:]) for s, ex in t3_sides(idx)] if ref else []
         mv["cancel"] = len(com.lists["cancel"])
-        com.lists["cancel"].extend(out)
+        com.lists["cancel"].extend(sides + out + [end])
         attempts[idx] = com.add("move", com.pack_move(mv))
         return attempts[idx]
 

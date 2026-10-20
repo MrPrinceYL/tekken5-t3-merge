@@ -109,6 +109,18 @@ fehlerfrei in T5. Jede Stufe erst im Spiel prüfen (headless + Bild), dann notie
       **Abdeckung: Ogre 141/141, True Ogre 146/146, Gun Jack 199/212, Gon 130/149, Dr. B
       201/237.** Struktur-Check + Zufallstest (alle Slots inkl. 88) stabil. Größen: Gon-Bank
       2099820 (Grenze 2141120), Gon-COM 436472 (Grenze 447872).
+      Würfe (21.10.): alle T3-Wurfseiten 2–17 (= T5-IDs: stehend/hockend/Rücken/Bauch × vorne/
+      hinten/links/rechts; Vorlage hat nur Listen für 2–5 mit Parameter 1536, die anderen
+      werden angelegt), Versuche aus den T3-Seiten gebaut; Wurf-Ausführungen übernehmen ihre
+      T3-Folgen; Bewegungseingaben auch zu Nicht-Angriffen. T3-Regel: Einträge mit Requirement
+      ≥ 0x45 nimmt T3 nie (FUN_8002de24) – Messung angepasst.
+      **Stand: Ogre 141/141, True Ogre 146/146, Gun Jack 206/212, Gon 132/149, Dr. B 201/235.**
+      Struktur-Check + Zufallstest stabil.
+      **Bekannte Grenzen (ohne T5-Gegenstück):** T3 req 28 = Whiff (Gon 6, Dr. B 4, Gun Jack 1
+      Erholungs-Moves); T3 req 67/68 = 120-Frame-Zähler +0x122 (gesetzt von Moves mit Flag
+      +0x24 Bit 0x10000, Dr. B 336/339/345/349/418/641–646) → Dr. Bs 10er-String 333→334…352
+      nur nach diesen Moves (18 Moves); req 24 (Zeit im Move ≥ X), 51 (+0xD5), 53, 55 (Gegner-
+      zustand) → Gons Leerlauf-Moves 4–8; req 2 (Wurfseite) in automatischen Übergängen.
       Rest (alt): Moves hinter nicht gepaarten Zuständen (from_unported: Dr. B 53, Gun Jack 33, Gon
       26 – z. B. T3-Liegeschleifen mit Bodenangriffen: Gun Jack 35/36, Gon 114/169, Dr. B 274;
       Gon 101 nach Sprung), tastenlose Übergänge mit Richtung (Gon 25), Bedingungen
