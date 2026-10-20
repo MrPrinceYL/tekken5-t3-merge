@@ -39,7 +39,20 @@ fehlerfrei in T5. Jede Stufe erst im Spiel prüfen (headless + Bild), dann notie
   fehlenden Größenskalierung. T3-Charakter-IDs (Tabelle 0x800958C4, Wert = m + 6): Ogre 14,
   Gun Jack 16, Gon 17, Dr. B 19, True Ogre 20.
 - [ ] **P4 True Ogre Schlangenhand + Schwanz bewegt** (Sekundärbewegung FUN_80037cbc als Animation).
-- [ ] **P5 Moveset 1:1 Rest:** übrige T3-Requirements/bedingte Ketten, Intros, Reaktionen ohne
+- [~] **P5 Moveset 1:1 (21.10., Nutzer: „alle Moves übernehmen“):** Zustandslisten (Stand + gepaarte
+      Zustände) jetzt ganz aus T3: alle T3-Angriffseinträge in T3-Reihenfolge mit T3-Zeitfenstern
+      (`t3_attack_entries`, auch gleiche Eingabe mehrfach, z. B. Sprungangriffe steigend/fallend),
+      Vorlagen-Angriffe ohne T3-Gegenstück entfernt; ein T5-Move je T3-Move (`clone_of_t3`).
+      Abdeckung erreichbarer T3-Angriffe (Messung `coverage.py`, Scratchpad – BFS ab Move 0 gegen
+      clones/states): Ogre 56→122/151, Gun Jack 92→129/213, Gon 55→73/150, Dr. B 81→125/243.
+      Moveset-Aufteilung per ram.csv (Tabelle[1]=0x6D580, [2]=0x77C00): alle außer King bis
+      447872 Byte (Ogre jetzt 412732). Fenstertest mit Zufallseingaben: alle fünf stabil.
+      Rest (Gründe laut coverage.py): Seitenvarianten req 36/38 bei den neuen Einträgen (nur der
+      alte Vorlagen-Weg kennt sie), tastenlose Übergänge zu Angriffen (Gon 34!), Bedingungen
+      (cond 17/90/84/15/4/30 – vermutlich True-Ogre-Feueratem u. Ä.: Ogre/True Ogre haben auf
+      der Disc ein byte-identisches T3-Paket (TOC 186/190/202/206)), Bewegungseingaben
+      (Gun Jack 0xC016–0xC01C), Moves nur über nicht gepaarte Zustände erreichbar (from_unported).
+- [ ] **P5-alt Moveset 1:1 Rest:** übrige T3-Requirements/bedingte Ketten, Intros, Reaktionen ohne
       Paar, gemeinsames T3-Animationspaket (TOC 279, Gon-Stand zerriss den Körper).
 - [ ] **P6 Stimmen:** T3-VAB `0x60+4m` → T5-Voiceclips.
 - [ ] **P7 Rest-UI:** Namensanzeige im Kampf, übrige 0x21-Grenzen (Ranglisten, Speicherstand, Endings).
@@ -82,10 +95,8 @@ Behoben (Commits 20.10.):
 - Diagnose: `T5_RESLOG=1` (Ressourcen-Anfragen), `T5_WATCHFN`, `T5_RAMSNAP` jetzt auch im
   Fensterbuild (mit `T5_SHOTS`). Prüfskripte (Requirement-/Struktur-Check der COM) lagen im
   Scratchpad; bei Bedarf als tools/ übernehmen.
-Geprüft (vor dem letzten Schritt, mit Slot-Schlüssel): Gon–Slot 3, Dr. B–Slot 3, King–Gon,
-Gun Jack–King, King–Dr. B, Dr. B–True Ogre im Kampf ok. **Der letzte Schritt (Schlüssel
-original + Flag-Hook) ist gebaut, aber noch NICHT getestet** → als Erstes: King 7 gegen 8,
-Gon gegen Paul (0), Gun Jack gegen Jack-5 (47), Gon gegen Slot 3, Dr. B gegen King.
+Geprüft (21.10., Endstand): King 7 gegen 8, Gon gegen Paul, Gun Jack gegen Jack-5, Gon gegen
+Slot 3, Dr. B gegen King, King–Gon, Gun Jack–King, Dr. B–True Ogre: alle Kämpfe laufen.
 
 ### Testablauf (20.10.)
 

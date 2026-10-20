@@ -96,6 +96,25 @@ def t3_attacks(ms, state=0):
     return out
 
 
+def t3_attack_entries(ms, state):
+    """Every attack entry of a T3 move's cancel list in T3 order: (key, T3 move, damage, frame
+    from, frame to, start frame). Unlike t3_attacks the same command can occur several times
+    (e.g. jump attacks rising / falling by frame window)."""
+    out = []
+    for _, e in ms.cancels(ms.own, ms.own.move(state)[3]):
+        cmd, cond, req, _, tgt, _, fr0, fr1, st = e
+        if cmd >= 0xC000 or cond not in FREE or req or not cmd & 0xF:
+            continue
+        pk, idx = ms.resolve(tgt)
+        if pk is not ms.own or idx >= pk.count:
+            continue
+        dmg = pk.move(idx)[5] & 0xFFFF
+        if not pk.move_bytes(idx)[0x2D] or dmg & 0x4000:
+            continue
+        out.append((t5_key(cmd), idx, dmg, max(fr0, 1), fr1, max(st, 1)))
+    return out
+
+
 # T5 state moves that may be paired with the T3 state of the same command (checked by name: the
 # same direction means a sidestep in T5 but a jump in T3, turns and crouch-to-stand differ too)
 PAIRABLE = re.compile(r"^(sJUMP_0[0E][_FB]|sWALK_00[FB](Lp)?|Pl_sDASHF(Lp)?|sDASH_00B(Lp)?|"
@@ -264,6 +283,7 @@ def build(m, costume, out_dir, template_slot=0):
     victim_skel = conv.skeleton_of((ROOT / "merge/extracted/tk5data1/0240.bin").read_bytes())
     reactions = Mapper(com)
     clones = {}                                       # (template move, T3 move) -> new move
+    clone_of_t3 = {}                                  # T3 move -> new move
     t3_anim = {}                                      # T3 move -> bank index
 
     def own_anim(t3idx, victim=False):
@@ -325,6 +345,8 @@ def build(m, costume, out_dir, template_slot=0):
         key = (tmove, t3idx)
         if key in clones:
             return clones[key]
+        if t3idx in clone_of_t3:                     # one T5 move per T3 move (first template)
+            return clone_of_t3[t3idx]
         mv = com.move(tmove)
         b = ms.own.move_bytes(t3idx)
         a = own_anim(t3idx)
@@ -337,6 +359,7 @@ def build(m, costume, out_dir, template_slot=0):
             mv["hitcond"] = copy_hitconds(mv["hitcond"], dmg, t3_reaction(ms, t3idx))
         new = com.add("move", com.pack_move(mv))     # reserved first: strings can loop
         clones[key] = new
+        clone_of_t3[t3idx] = new
         # follow-ups: T3 cancels with buttons -> T5 string entries (flag 0x20, extradata 9 as
         # the template's strings); template entries without buttons and its end entry stay
         entries = []
@@ -431,6 +454,7 @@ def build(m, costume, out_dir, template_slot=0):
         return out
 
     pairs = {stand: 0}
+    n_added = 0
     queue = [stand]
     n_states = 0
     while queue:
@@ -438,7 +462,7 @@ def build(m, costume, out_dir, template_slot=0):
         st3 = pairs[j]
         local = t3_attacks(ms, st3)
         follow = t3_state_moves(ms, st3)
-        entries = []
+        entries, sample = [], None
         for e in inline(com.move(j)["cancel"]):
             f = list(struct.unpack(CANCEL, e))
             cmd, mvi = f[0], f[2]
@@ -453,12 +477,19 @@ def build(m, costume, out_dir, template_slot=0):
                     pairs[mvi] = follow[k]
                     queue.append(mvi)
             elif mvi < n_template and com.move(mvi)["active_start"] and not keep(mvi):
-                key = (cmd & 0xFFFF, btn)
-                if key[0] == 0 and key not in local:
-                    key = (0x20, btn)
-                if key in local:
-                    f[2] = clone(mvi, *local[key])
+                sample = sample or f
+                continue                      # template attacks: replaced by the T3 list below
             entries.append(struct.pack(CANCEL, *f))
+        # the T3 state's attacks, all of them in T3 order with T3's frame windows, in front
+        front = []
+        for key, t3idx, dmg, fr0, fr1, st in t3_attack_entries(ms, st3):
+            tm = tmpl_of.get(key) or next((v for k, v in tmpl_of.items() if k[1] == key[1]),
+                                          next(iter(tmpl_of.values())))
+            ref = sample or [0, 0, 0, 0, 1, 255, 1, 0]
+            front.append(struct.pack(CANCEL, key[0] | key[1] << 16, 0, clone(tm, t3idx, dmg),
+                                     ref[3], fr0, fr1, st, ref[7]))
+            n_added += 1
+        entries = front + entries
         mv = com.move(j)
         mv["cancel"] = len(com.lists["cancel"])
         com.lists["cancel"].extend(entries)
@@ -632,15 +663,15 @@ def build(m, costume, out_dir, template_slot=0):
     anims = scale_to_body(m, costume, template_slot, com, anims, n_tpl, t3_anim)
     if m in GON_MODELS:
         gon_always_low(com)
-    # the game keeps both players' movesets in 938368 bytes: the second buffer has 425472
-    # (FUN_00101310 table 0x14D350; only King's gets more). Drop the template moves the clones
-    # replaced and their cancel lists (indices in states.txt / clones.txt are from before this).
+    # the game keeps both players' movesets in 938368 bytes, merge/data/ram.csv splits them so
+    # that every character but King gets 447872 on either side. Drop the template moves the
+    # clones replaced and their cancel lists (indices in states.txt / clones.txt are from before).
     dead = com.remove_dead_moves()
     com.compact_cancels()
     anims = drop_unused_animations(com, anims)
     raw = com.build()
     print(f"moveset: {len(raw)} bytes after dropping {dead} unreachable moves")
-    assert len(raw) <= 425472, "moveset larger than the second player's buffer"
+    assert len(raw) <= 447872, "moveset larger than a player's moveset area"
     (out / "moveset.bin").write_bytes(lz_pack(raw))
     bank = t5_bank.build(bank_tpl, anims)
     print(f"bank: {len(bank)} bytes")
@@ -648,6 +679,7 @@ def build(m, costume, out_dir, template_slot=0):
     # 2141120 on either side
     assert len(bank) <= 2141120, "animation bank larger than a player's bank area"
     (out / "bank.bin").write_bytes(bank)
+    print(f"added state attacks {n_added}")
     print(f"T3 attacks {len(attacks)}, new moves {len(clones)}, new animations {len(t3_anim)}, "
           f"redirected cancels {redirected}, motions {moved}, throw sides {n_throws}, states {n_states}, "
           f"win poses {n_wins} from T3 {wins}")
