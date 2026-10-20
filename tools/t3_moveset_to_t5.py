@@ -214,6 +214,27 @@ def t5_bank_anims(data):
     return bank(data)[1]
 
 
+# T3 model -> T3 character id (table 0x800958C4: four model slots per character, value = m + 6).
+GON_MODELS = (36, 37)
+STAND_VULN = (0x0842, 0x1052, 0x1952)
+
+
+def gon_always_low(com):
+    """Gon's gimmick (T3 FUN_8003f098: against anyone but Gon the crouch flag +0xDF is always
+    set; FUN_8002d8b4: throws on Gon fail): every standing vulnerability becomes its crouching
+    form (T5 crouch moves: 0x0842 -> 0x2821, 0x1052 -> 0x3029, 0x1952 -> 0x3929), so high attacks
+    and standing throws miss him. Gon against Gon cannot be told apart here (T3 exempts it)."""
+    n = 0
+    for i in range(len(com.lists["move"])):
+        mv = com.move(i)
+        v = mv["vuln"]
+        if v & 0xFFFF in STAND_VULN:
+            mv["vuln"] = (v & ~0xFFFF) | 0x2000 | (v & 0xFF00) | (v & 0xFF) >> 1
+            com.lists["move"][i] = com.pack_move(mv)
+            n += 1
+    print(f"Gon: {n} standing vulnerabilities made low")
+
+
 def build(m, costume, out_dir, template_slot=0):
     ms = Moveset(m)
     attacks = t3_attacks(ms)
@@ -550,6 +571,8 @@ def build(m, costume, out_dir, template_slot=0):
         for (tm, t3), new in sorted(clones.items(), key=lambda kv: kv[1]):
             fh.write(f"{new} T3-{t3} ({com.name(com.move(tm)['name'])})\n")
     anims = scale_to_body(m, costume, template_slot, com, anims, n_tpl, t3_anim)
+    if m in GON_MODELS:
+        gon_always_low(com)
     (out / "moveset.bin").write_bytes(lz_pack(com.build()))
     (out / "bank.bin").write_bytes(t5_bank.build(bank_tpl, anims))
     print(f"T3 attacks {len(attacks)}, new moves {len(clones)}, new animations {len(t3_anim)}, "
