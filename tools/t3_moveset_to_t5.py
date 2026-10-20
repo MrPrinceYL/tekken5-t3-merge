@@ -46,6 +46,30 @@ REQ_END = 0x141                                        # T5 requirement list end
 REQ_NONE = (0, 39, 57)
 
 
+NUMPAD = {1: 0x2, 2: 0x4, 3: 0x8, 4: 0x10, 5: 0x20, 6: 0x40, 7: 0x80, 8: 0x100, 9: 0x200}
+
+
+def is_t3_sequence(cmd):
+    """T3 input-sequence commands (FUN_8002cc28: tables 0x800954D0 / 0x800955CC)."""
+    return 0xC00E <= cmd < 0xC00E + 0x3F or 0xC7FF <= cmd < 0xC7FF + 0x29
+
+
+def t3_sequence(cmd):
+    """(frame window, [u16 inputs]) of a T3 input sequence (FUN_8002ca84: oldest first; low
+    nibble = numpad direction, high byte = buttons; the last input is the one that triggers)."""
+    from t3_anim import _ram
+    base, i = (0x800954D0, cmd - 0xC00E) if cmd < 0xC7FF else (0x800955CC, cmd - 0xC7FF)
+    p, = struct.unpack("<I", _ram(base + 4 * i, 4))
+    win, = struct.unpack("<h", _ram(p, 2))
+    out, q = [], p + 2
+    while True:
+        v, = struct.unpack("<H", _ram(q, 2))
+        if not v:
+            return win, out
+        out.append(v)
+        q += 2
+
+
 def t3_character(m):
     """T3 character id of model m (table 0x800958C4: four model slots per character, m + 6)."""
     from t3_anim import _ram
@@ -445,7 +469,17 @@ def build(m, costume, out_dir, template_slot=0):
         for _, e in ms.cancels(ms.own, ms.own.move(t3idx)[3]):
             cmd, cond, req, _, tgt, _, fr0, fr1, st = e
             rqs = t5_reqs(req)
-            if cmd >= 0xC000 or not cond_ok(cond, ms) or rqs is None:
+            if not cond_ok(cond, ms) or rqs is None:
+                continue
+            if is_t3_sequence(cmd):
+                a = t3_attack(tgt)
+                if a is not None:
+                    child = clone(tmove, *a)
+                    for rq in rqs:
+                        entries.append(struct.pack(CANCEL, t5_sequence(cmd), rq, child, 7,
+                                                   max(fr0, 1), fr1, max(st, 1), 0))
+                continue
+            if cmd >= 0xC000:
                 continue
             if cmd == 0x10:
                 # automatic continuation in a frame window (multi-part moves): T5 command 0;
@@ -576,18 +610,43 @@ def build(m, costume, out_dir, template_slot=0):
 
     def attack_entry(e):
         """T5 entry data of one T3 cancel entry if it is an attack this character has:
-        [(key, T3 move, damage, from, to, start, requirement list indices)] or []."""
+        [(key, T3 move, damage, from, to, start, requirement list indices)] or []. Input
+        sequences (motions) get key (T5 sequence command, 0)."""
         cmd, cond, req, _, tgt, _, fr0, fr1, st = e
         rqs = t5_reqs(req)
-        if cmd >= 0xC000 or not cmd & 0xF or not cond_ok(cond, ms) or rqs is None:
+        if not cond_ok(cond, ms) or rqs is None:
             return []
+        if is_t3_sequence(cmd):
+            key = (t5_sequence(cmd), 0)
+        elif cmd >= 0xC000 or not cmd & 0xF:
+            return []
+        else:
+            key = t5_key(cmd)
         pk, idx = ms.resolve(tgt)
         if pk is not ms.own or idx >= pk.count:
             return []
         dmg = pk.move(idx)[5] & 0xFFFF
         if not pk.move_bytes(idx)[0x2D] or dmg & 0x4000:
             return []
-        return [(t5_key(cmd), idx, dmg, max(fr0, 1), fr1, max(st, 1), rqs)]
+        return [(key, idx, dmg, max(fr0, 1), fr1, max(st, 1), rqs)]
+
+    sequences = {}
+
+    def t5_sequence(cmd):
+        """T5 command (0x8013 + input_seq index) for a T3 input sequence: inputs oldest first,
+        directions as flag 0x40 entries, the triggering one with buttons as flag 0x20 (Paul's
+        e.g. 0x808F = n, f, d, d/b+1)."""
+        if cmd not in sequences:
+            win, ins = t3_sequence(cmd)
+            start = len(com.lists["input"])
+            for k, v in enumerate(ins):
+                d, btn = NUMPAD.get(v & 0xF, 0x20), (v >> 8) & 0xF
+                last = k == len(ins) - 1
+                flag = 0x20 if last and btn else 0x40
+                com.lists["input"].append(struct.pack("<I", flag << 24 | btn << 16 | d))
+            sequences[cmd] = 0x8013 + com.add("input_seq", struct.pack("<HHI", max(win, 1), len(ins), start))
+        return sequences[cmd]
+
     n_states = 0
     while queue:
         j = queue.pop(0)
@@ -875,9 +934,14 @@ def build(m, costume, out_dir, template_slot=0):
             for _, e in ms.cancels(ms.own, ms.own.move(st3)[3]):
                 cmd, cond, req, _, tgt, _, fr0, fr1, st = e
                 rqs = t5_reqs(req)
-                if cmd >= 0xC000 or not cmd & 0xF or not cond_ok(cond, ms) or rqs is None:
+                if not cond_ok(cond, ms) or rqs is None:
                     continue
-                key = t5_key(cmd)
+                if is_t3_sequence(cmd):
+                    key = (t5_sequence(cmd), 0)
+                elif cmd >= 0xC000 or not cmd & 0xF:
+                    continue
+                else:
+                    key = t5_key(cmd)
                 if st3 == 0 and key in ((0, 5), (0, 10), (0x20, 5), (0x20, 10)) and req == 0:
                     continue                                  # the template's 1+3 / 2+4
                 pk, idx = ms.resolve(tgt)

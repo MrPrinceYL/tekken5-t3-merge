@@ -93,6 +93,12 @@ fehlerfrei in T5. Jede Stufe erst im Spiel prüfen (headless + Bild), dann notie
       werden jetzt T5-Gruppenlisten mit 0x8005-Aufruf statt in jede Zustandsliste kopiert
       (`Moveset.cancels_grouped`, `attack_entry`, `t5_groups`) → True Ogre 424756 Byte, Abdeckung
       unverändert, Zufallstest stabil.
+      Bewegungseingaben (21.10.): T3-Folgen (0xC00E.., 0xC7FF..; FUN_8002ca84: Zeitfenster +
+      Eingaben ältest zuerst, Numpad-Richtung im unteren Nibble, Tasten im oberen Byte) →
+      T5 `input_seq` (Fenster, Anzahl, Start) + `input` (u32: Flag 0x40 Richtung, 0x20 auslösende
+      Eingabe mit Tasten), Befehl 0x8013 + Index (an Pauls 0x808F = n,f,d,d/b+1 geprüft) –
+      in Zuständen, Folgeeinträgen und Befehlswürfen. **Ogre 141/141, True Ogre 146/146, Gun Jack
+      198/212.**
       Rest (alt): Moves hinter nicht gepaarten Zuständen (from_unported: Dr. B 53, Gun Jack 33, Gon
       26 – z. B. T3-Liegeschleifen mit Bodenangriffen: Gun Jack 35/36, Gon 114/169, Dr. B 274;
       Gon 101 nach Sprung), tastenlose Übergänge mit Richtung (Gon 25), Bedingungen
