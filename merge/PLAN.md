@@ -99,6 +99,16 @@ fehlerfrei in T5. Jede Stufe erst im Spiel prüfen (headless + Bild), dann notie
       Eingabe mit Tasten), Befehl 0x8013 + Index (an Pauls 0x808F = n,f,d,d/b+1 geprüft) –
       in Zuständen, Folgeeinträgen und Befehlswürfen. **Ogre 141/141, True Ogre 146/146, Gun Jack
       198/212.**
+      Zustände (21.10.): T3-Stand = Move 0 + seine „next“-Kette aus Nicht-Angriffen (Gon 0→1,
+      Dr. B 0→1) + weitere erreichbare Stand-Ruheschleifen mit Angriffen (Dr. B 242); T5-Hocke
+      (Alias 2 `Pl_cKAM00_`, bisher ungepaart = noch Pauls Hockangriffe!) gepaart mit allen
+      T3-Hockschleifen (vuln-Bit 0x2000: Ogre 14, Gon 9, Dr. B 243 …). Tasteneinträge auch zu
+      Nicht-Angriffen (Haltungen, Rollen; Vorlage Stand bzw. Liegen), Liegeschleife als
+      Folgezug nach Knockdowns. Folgelisten in `clone()` nutzen T3-Gruppen als T5-Gruppen
+      (`follow_entry`, `follow_groups`), T3-Dash 0xC001/0xC002 → T5 0x8001/0x8002.
+      **Abdeckung: Ogre 141/141, True Ogre 146/146, Gun Jack 199/212, Gon 130/149, Dr. B
+      201/237.** Struktur-Check + Zufallstest (alle Slots inkl. 88) stabil. Größen: Gon-Bank
+      2099820 (Grenze 2141120), Gon-COM 436472 (Grenze 447872).
       Rest (alt): Moves hinter nicht gepaarten Zuständen (from_unported: Dr. B 53, Gun Jack 33, Gon
       26 – z. B. T3-Liegeschleifen mit Bodenangriffen: Gun Jack 35/36, Gon 114/169, Dr. B 274;
       Gon 101 nach Sprung), tastenlose Übergänge mit Richtung (Gon 25), Bedingungen

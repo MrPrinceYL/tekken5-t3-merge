@@ -440,6 +440,59 @@ def build(m, costume, out_dir, template_slot=0):
             return None
         return [req_list[x] for x in t5]
 
+    follow_groups = {}                                # T3 group -> (T5 group start, count) / None
+
+    def follow_entry(e, tmove):
+        """T5 entries for one T3 cancel entry of a ported move's list (strings, automatic and
+        direction transitions, motions, dashes); [] if it has no T5 form (yet)."""
+        cmd, cond, req, _, tgt, _, fr0, fr1, st = e
+        rqs = t5_reqs(req)
+        if not cond_ok(cond, ms) or rqs is None:
+            return []
+        out = []
+        if is_t3_sequence(cmd):
+            a = t3_attack(tgt)
+            if a is not None:
+                child = clone(tmove, *a)
+                out = [struct.pack(CANCEL, t5_sequence(cmd), rq, child, 7, max(fr0, 1), fr1,
+                                   max(st, 1), 0) for rq in rqs]
+            return out
+        if cmd in (0xC001, 0xC002):                    # dash forward / back: T5 0x8001 / 0x8002
+            a = own_move(tgt)
+            if a is not None and a[0] > 1 and not resting(a[0]):
+                child = clone(tmove, *a)
+                out = [struct.pack(CANCEL, cmd - 0xC000 + 0x8000, rq, child, 14, max(fr0, 1), fr1,
+                                   max(st, 1), 0) for rq in rqs]
+            return out
+        if cmd >= 0xC000:
+            return []
+        if cmd == 0x10:
+            # automatic continuation in a frame window (multi-part moves): T5 command 0;
+            # T3 "on hit" / "on contact" become T5 requirement lists (one entry each)
+            a = own_move(tgt)
+            if a is not None:
+                child = clone(tmove, *a)
+                out = [struct.pack(CANCEL, 0, rq, child, 0, max(fr0, 1), fr1, max(st, 1), 0)
+                       for rq in rqs]
+            return out
+        if not cmd & 0xF:
+            # direction only (held): landings, rolls, stance changes inside a move
+            a = own_move(tgt)
+            if a is not None and a[0] > 1:
+                lie = lying_template(a[0])
+                if lie is not None or not resting(a[0]):
+                    child = clone(lie if lie is not None else tmove, *a)
+                    out = [struct.pack(CANCEL, t5_key(cmd)[0], rq, child, 0, max(fr0, 1), fr1,
+                                       max(st, 1), 0) for rq in rqs]
+            return out
+        a = t3_attack(tgt)
+        if a is None:
+            return []
+        k = t5_key(cmd)
+        child = clone(tmpl_of.get(k, tmove), *a)
+        return [struct.pack(CANCEL, k[0] | k[1] << 16 | 0x20 << 24, rq, child, 9, fr0, fr1, st, 0)
+                for rq in rqs]
+
     def clone(tmove, t3idx, dmg):
         """New move = template attack `tmove` with T3 move `t3idx` (animation, damage, active
         frames, follow-ups from its T3 cancel list)."""
@@ -465,51 +518,29 @@ def build(m, costume, out_dir, template_slot=0):
         clone_of_t3[t3idx] = new
         # follow-ups: T3 cancels with buttons -> T5 string entries (flag 0x20, extradata 9 as
         # the template's strings); template entries without buttons and its end entry stay
+        # (T3's shared groups become T5 group lists once, then called with 0x8005)
         entries = []
-        for _, e in ms.cancels(ms.own, ms.own.move(t3idx)[3]):
-            cmd, cond, req, _, tgt, _, fr0, fr1, st = e
-            rqs = t5_reqs(req)
-            if not cond_ok(cond, ms) or rqs is None:
+        runs = []                                         # [(group or None, [T3 entries])]
+        for _, e, gid in ms.cancels_grouped(ms.own, ms.own.move(t3idx)[3]):
+            if not runs or runs[-1][0] != gid:
+                runs.append((gid, []))
+            runs[-1][1].append(e)
+        for gid, es in runs:
+            if gid is None:
+                for e in es:
+                    entries.extend(follow_entry(e, tmove))
                 continue
-            if is_t3_sequence(cmd):
-                a = t3_attack(tgt)
-                if a is not None:
-                    child = clone(tmove, *a)
-                    for rq in rqs:
-                        entries.append(struct.pack(CANCEL, t5_sequence(cmd), rq, child, 7,
-                                                   max(fr0, 1), fr1, max(st, 1), 0))
-                continue
-            if cmd >= 0xC000:
-                continue
-            if cmd == 0x10:
-                # automatic continuation in a frame window (multi-part moves): T5 command 0;
-                # T3 "on hit" / "on contact" become T5 requirement lists (one entry each)
-                a = own_move(tgt)
-                if a is not None:
-                    child = clone(tmove, *a)
-                    for rq in rqs:
-                        entries.append(struct.pack(CANCEL, 0, rq, child, 0,
-                                                   max(fr0, 1), fr1, max(st, 1), 0))
-                continue
-            if not cmd & 0xF:
-                # direction only (held): landings, rolls, stance changes inside a move
-                a = own_move(tgt)
-                if a is not None and a[0] > 1:
-                    lie = lying_template(a[0])
-                    if lie is not None or not resting(a[0]):
-                        child = clone(lie if lie is not None else tmove, *a)
-                        for rq in rqs:
-                            entries.append(struct.pack(CANCEL, t5_key(cmd)[0], rq, child,
-                                                       0, max(fr0, 1), fr1, max(st, 1), 0))
-                continue
-            a = t3_attack(tgt)
-            if a is None:
-                continue
-            k = t5_key(cmd)
-            child = clone(tmpl_of.get(k, tmove), *a)
-            for rq in rqs:
-                entries.append(struct.pack(CANCEL, k[0] | k[1] << 16 | 0x20 << 24, rq, child, 9,
-                                           fr0, fr1, st, 0))
+            if gid not in follow_groups:
+                out = [x for e in es for x in follow_entry(e, tmove)]
+                if out:
+                    follow_groups[gid] = (len(com.lists["group_cancel"]), len(out))
+                    com.lists["group_cancel"].extend(out)
+                    com.lists["group_cancel"].append(struct.pack(CANCEL, 0x8006, 0, 0, 0, 0, 0, 0, 0))
+                else:
+                    follow_groups[gid] = None
+            g = follow_groups[gid]
+            if g is not None:
+                entries.append(struct.pack(CANCEL, 0x8005, 0, g[0], 0, 0, 0, g[1], 0))
         # T3's follow-up at the end of the animation, unless it is standing or a resting loop
         # (those stay the template's: the T5 state machine's own way back)
         nxt = own_move(struct.unpack_from("<H", b, 0x10)[0])
@@ -518,6 +549,8 @@ def build(m, costume, out_dir, template_slot=0):
             nb = ms.own.move_bytes(nxt[0])
             if own_move(struct.unpack_from("<H", nb, 0x10)[0]) != nxt:
                 follow = clone(tmove, *nxt)
+            elif lying_template(nxt[0]) is not None:      # knocked down: T3's lying loop
+                follow = clone(lying_template(nxt[0]), *nxt)
         length = ms.own.anim_frames(t3idx, ms.common)
         for e in com.lists["cancel"][mv["cancel"]:]:
             f = list(struct.unpack(CANCEL, e))
@@ -626,9 +659,53 @@ def build(m, costume, out_dir, template_slot=0):
         if pk is not ms.own or idx >= pk.count:
             return []
         dmg = pk.move(idx)[5] & 0xFFFF
-        if not pk.move_bytes(idx)[0x2D] or dmg & 0x4000:
-            return []
+        if dmg & 0x4000:
+            return []                                   # throws: their own pass
+        if not pk.move_bytes(idx)[0x2D] and (idx <= 1 or resting(idx)):
+            return []                                   # standing / resting loops: T5 states
         return [(key, idx, dmg, max(fr0, 1), fr1, max(st, 1), rqs)]
+
+    def stand_chain():
+        """T3 standing is move 0 and the non-attack moves its follow-ups lead to (Gon: 0 -> 1,
+        Dr. B 0 -> 1): the T5 standing loop gets all their entries."""
+        out, i = [0], 0
+        while len(out) < 4:
+            nxt = own_move(struct.unpack_from("<H", ms.own.move_bytes(i), 0x10)[0])
+            if nxt is None or nxt[0] in out or ms.own.move_bytes(nxt[0])[0x2D]:
+                break
+            out.append(nxt[0])
+            i = nxt[0]
+        return out
+
+    # every T3 resting loop the character can reach, by class: standing ones (Dr. B's 242 ...)
+    # join the T5 standing state, crouching ones (vuln bit 0x2000: Dr. B's 243, Ogre's 14 ...)
+    # the T5 crouching state (alias 2)
+    reach, todo = {0}, [0]
+    while todo:
+        i = todo.pop()
+        nx = struct.unpack_from("<H", ms.own.move_bytes(i), 0x10)[0]
+        for _, e in ms.cancels(ms.own, ms.own.move(i)[3]) + [("next", (0, 0, 0, 0, nx, 0, 0, 0, 0))]:
+            if cond_ok(e[1], ms):
+                pk, k = ms.resolve(e[4])
+                if pk is ms.own and k < pk.count and k not in reach:
+                    reach.add(k)
+                    todo.append(k)
+    loops = sorted(i for i in reach if resting(i) and ms.own.move(i)[1] & 0xFFFF not in (0x3884, 0x4284))
+    crouch_loops = [i for i in loops if ms.own.move(i)[1] & 0x2000]
+    stand_loops = [i for i in loops if not ms.own.move(i)[1] & 0x2000 and i > 1
+                   and t3_attack_entries(ms, i)]
+    crouch = aliases[2]
+
+    def state_moves(j, st3):
+        if j == stand:
+            return stand_chain() + [i for i in stand_loops if i not in stand_chain()]
+        if j == crouch:
+            return crouch_loops or [st3]
+        return [st3]
+
+    if crouch_loops and crouch not in pairs:
+        pairs[crouch] = crouch_loops[0]
+        queue.append(crouch)
 
     sequences = {}
 
@@ -692,15 +769,21 @@ def build(m, costume, out_dir, template_slot=0):
             if g is not None:
                 front.append(struct.pack(CANCEL, 0x8005, 0, g[0], 0, 0, 0, g[1], 0))
 
-        for _, e, gid in ms.cancels_grouped(ms.own, ms.own.move(st3)[3]):
+        state_entries = []
+        for s3 in state_moves(j, st3):
+            state_entries += ms.cancels_grouped(ms.own, ms.own.move(s3)[3])
+        for _, e, gid in state_entries:
             if gid != run_gid:
                 flush()
                 run, run_gid = [], gid
             if gid is not None and gid in t5_groups:
                 continue                                  # translated once already
             for key, t3idx, dmg, fr0, fr1, st, rqs in attack_entry(e):
-                tm = tmpl_of.get(key) or next((v for k, v in tmpl_of.items() if k[1] == key[1]),
-                                              next(iter(tmpl_of.values())))
+                if ms.own.move_bytes(t3idx)[0x2D]:
+                    tm = tmpl_of.get(key) or next((v for k, v in tmpl_of.items() if k[1] == key[1]),
+                                                  next(iter(tmpl_of.values())))
+                else:
+                    tm = lying_template(t3idx) or stand    # stance changes, rolls ...
                 child = clone(tm, t3idx, dmg)
                 for rq in rqs:
                     run.append(struct.pack(CANCEL, key[0] | key[1] << 16, rq, child,
