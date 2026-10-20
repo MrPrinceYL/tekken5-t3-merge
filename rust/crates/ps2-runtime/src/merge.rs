@@ -26,9 +26,15 @@ use ee_core::{Ctx, GPR_A0, GPR_V0};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-const TOC: u32 = 0x0046_B730;
-const SUMS: u32 = 0x0046_E9B8;
+/// TK5DATA1 table of contents {sector, size} and word sums of the game, 0x623 entries ...
+const TOC_ORIG: u32 = 0x0046_B730;
+const SUMS_ORIG: u32 = 0x0046_E9B8;
 const TOC_ENTRIES: u32 = 0x623;
+/// ... copied to the mod area with room for more files (merge/patches.csv points the four
+/// accessors FUN_0023f378 / 0023f5c0 / 0023faa8 / 0023fcb0 here, bound 0x700).
+const TOC: u32 = 0x0012_2000;
+const SUMS: u32 = 0x0012_6000;
+const TOC_MAX: u32 = 0x700;
 /// Resource type table of FUN_001f09b8: {s16 base, u16 kind} per type.
 const TYPES: u32 = 0x0046_2F98;
 /// TOC entries no lookup of the original game reaches (merge/PLAN.md), in allocation order.
@@ -151,11 +157,17 @@ pub fn on_main(c: &mut Ctx) {
         load_slots(c);
         return;
     }
+    for i in 0..TOC_MAX {
+        let (e, s) = if i < TOC_ENTRIES { (rd32(c, TOC_ORIG + i * 8), rd32(c, TOC_ORIG + i * 8 + 4)) } else { (0, 0) };
+        wr32(c, TOC + i * 8, e);
+        wr32(c, TOC + i * 8 + 4, s);
+        wr32(c, SUMS + i * 4, if i < TOC_ENTRIES { rd32(c, SUMS_ORIG + i * 4) } else { 0 });
+    }
     let mut state = STATE.lock().unwrap();
     if state.placed.is_empty() && !files.is_empty() {
         let m = crate::machine();
         let Some(disc) = m.disc.as_mut() else { return };
-        let mut free = FREE.iter().flat_map(|&(a, b)| a..=b).filter(|&i| rd32(c, TOC + i * 8 + 4) == 0);
+        let mut free = FREE.iter().flat_map(|&(a, b)| a..=b).chain(TOC_ENTRIES..TOC_MAX).filter(|&i| rd32(c, TOC + i * 8 + 4) == 0);
         for f in files {
             let index = match f.target {
                 Target::Index(i) if i < TOC_ENTRIES => i,

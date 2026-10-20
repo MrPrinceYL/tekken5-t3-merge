@@ -1,8 +1,31 @@
 # Tekken5-Tekken3-Merge: Dr. B, Ogre, True Ogre, Gon, Gun Jack in Tekken 5
 
-Kopie von `Tekken5Decomp` (Stand 12.10.2026, ohne `rust/target`). Das Original bleibt Vanilla.
+Kopie von `Tekken5Decomp` (seit 20.10.2026 auf aktuellem Stand c10dc5303, siehe CLAUDE.md „Basis“). Das Original bleibt Vanilla.
 Diese Kopie ist bewusst ein Mod: die 1:1-Paritätsregel gilt hier nur für alles außerhalb der
 neuen Charaktere.
+
+## Prioritäten (Stand 20.10., Reihenfolge = Abarbeitung)
+
+Ziel (Nutzer): alle fünf 1:1 wie in T3 (Modell, Moveset, Posen, Portrait, Gimmicks …) und
+fehlerfrei in T5. Jede Stufe erst im Spiel prüfen (headless + Bild), dann notieren + committen.
+
+- [ ] **P0 Stand im neuen Build prüfen:** alle fünf auswählbar, Kampf läuft, Grafik ok (je
+      Charakter headless mit `T5_FORCE_SLOT`), offener Test „nur gegen Paul/Jack-5 als P2“.
+- [ ] **P1 Gimmick Gon (nur Gon):** klein (3DMK-Größe 45 % statt 100 %) – Modell und
+      Skelett/Trefferkugeln/Kollision verkleinern, damit hohe Angriffe über ihn gehen wie in T3.
+      T3-Mechanik nachlesen (Tekken3Decomp: wie die Größe Treffer/Wurf beeinflusst).
+- [ ] **P2 Gimmick Dr. B (nur Dr. B):** kann nicht lange stehen (Rücken) – T3-Stand-Kette
+      (Stand → Umfallen/Liegen nach Zeit) und Bodenspiel aus dem T3-Moveset übernehmen.
+- [ ] **P3 Füße verbuggt** (Nutzer 13.10.) – Ursache finden (Skinning/Retargeting/geteilte Ressource).
+- [ ] **P4 True Ogre Schlangenhand + Schwanz bewegt** (Sekundärbewegung FUN_80037cbc als Animation).
+- [ ] **P5 Moveset 1:1 Rest:** übrige T3-Requirements/bedingte Ketten, Intros, Reaktionen ohne
+      Paar, gemeinsames T3-Animationspaket (TOC 279, Gon-Stand zerriss den Körper).
+- [ ] **P6 Stimmen:** T3-VAB `0x60+4m` → T5-Voiceclips.
+- [ ] **P7 Rest-UI:** Namensanzeige im Kampf, übrige 0x21-Grenzen (Ranglisten, Speicherstand, Endings).
+- [ ] **P8 Charakterbilder Ogre / True Ogre (Nutzer 20.10., niedrige Priorität):** große
+      Auswahlbilder zu klein – Gesicht auf Höhe und Größe von Devil Jins Bild verschieben und
+      skalieren (Devil Jin = Vorlage). Außerdem stehen die P2-Bilder auf der falschen Seite
+      (links statt rechts). Werkzeug `tools/t5_portraits.py`, Quellen `merge/png/t3_to_t5_portraits`.
 
 ## Ausgangslage
 
