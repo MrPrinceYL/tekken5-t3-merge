@@ -164,6 +164,35 @@ class Com:
         self.lists["move"] = moves
         return n - len(live)
 
+    def drop_group_entries(self, drop):
+        """Remove the group-cancel entries for which drop(fields) is true and renumber every
+        group call (0x8005: move field = group start, start-frame field = entry count)."""
+        old = [struct.unpack(CANCEL, e) for e in self.lists["group_cancel"]]
+        new, at = [], {}
+        for k, f in enumerate(old):
+            at[k] = len(new)
+            if f[0] == 0x8006 or not drop(f):
+                new.append(f)
+        at[len(old)] = len(new)
+
+        def count(g):
+            n = 0
+            while new[g + n][0] != 0x8006:
+                n += 1
+            return n
+
+        for name in ("cancel", "group_cancel"):
+            src = [struct.unpack(CANCEL, e) for e in self.lists[name]] if name == "cancel" else new
+            out = []
+            for f in src:
+                f = list(f)
+                if f[0] == 0x8005:
+                    f[2] = at[f[2]]
+                    f[6] = count(f[2])
+                out.append(struct.pack(CANCEL, *f))
+            self.lists[name] = out
+        return len(old) - len(new)
+
     def compact_cancels(self):
         """Keep only the cancel lists moves start (each up to its 0x8000 end entry) and share
         identical ones; the converter's clones leave the replaced template lists behind. Moves

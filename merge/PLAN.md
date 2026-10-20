@@ -64,7 +64,20 @@ fehlerfrei in T5. Jede Stufe erst im Spiel prüfen (headless + Bild), dann notie
       unbekannt, T5→T7-Tabelle in TKMovesets kennt nur 40 On Hit / 41 On Block), 24 = Zähler
       +0xF8 ≥ Parameter, 36 = Winkel (Rücken). Abdeckung: Ogre 135/151, Gun Jack 150/213,
       Gon 90/150, Dr. B 174/243. Zufallseingaben-Test stabil (300 LOGIC/5 s).
-      Rest: Moves hinter nicht gepaarten Zuständen (from_unported: Dr. B 53, Gun Jack 33, Gon
+      Weiter (21.10., Nutzer: „sollen sich 1:1 wie in T3 spielen“): T3 req 26 → T5 40 (On
+      Hit), req 1 → T5 40 + 41 (je ein Eintrag) in automatischen Übergängen (`t5_reqs`);
+      zweiter Durchgang über alle Zustände: T3-Richtungsübergänge ohne Taste zu Moves, die kein
+      T5-Zustand sind (Rollen, Landungen), vor die T5-Bewegungseinträge; Vorlagen-Angriffe
+      auch aus den Gruppenlisten entfernt (`Com.drop_group_entries`, Gruppenaufruf-Länge =
+      Start-Frame-Feld); Klone übernehmen von der Vorlage nur noch Sonderbefehle (0x8001..)
+      und das Ende, nicht mehr deren Richtungs-/Treffer-Übergänge (nicht T3, und sie machten
+      die Abbruchlisten zu groß); gleiche Trefferbedingungs-Listen geteilt. Abdeckung: Ogre
+      139/151, Gun Jack 168/213, Gon 101/150, Dr. B 175/243. Struktur-Check + Zufallseingaben-
+      Test (alle fünf, Fenster): stabil, 300 LOGIC/5 s, Treffer/K.O./Runden normal.
+      Offen: T3 req 28 = Whiff (keine T5-ID gefunden; Gon 6 Moves), req 24/51/55, cond
+      17/20/90/84/15 (True-Ogre-Sachen?), Bewegungseingaben (Gun Jack 6, Dr. B 2), restliche
+      from_unported; Schadensskala T3 ↔ T5-Lebenspunkte prüfen.
+      Rest (alt): Moves hinter nicht gepaarten Zuständen (from_unported: Dr. B 53, Gun Jack 33, Gon
       26 – z. B. T3-Liegeschleifen mit Bodenangriffen: Gun Jack 35/36, Gon 114/169, Dr. B 274;
       Gon 101 nach Sprung), tastenlose Übergänge mit Richtung (Gon 25), Bedingungen
       (cond 17/90/84/15/4/30 – vermutlich True-Ogre-Feueratem u. Ä.: Ogre/True Ogre haben auf

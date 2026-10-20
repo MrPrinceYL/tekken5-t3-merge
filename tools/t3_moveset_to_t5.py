@@ -349,6 +349,8 @@ def build(m, costume, out_dir, template_slot=0):
             return None
         return idx, dmg
 
+    hitcond_lists = {}
+
     def copy_hitconds(h, dmg, rea_t3=None):
         """Copy the template's hit condition list (entries up to the one whose requirement list
         is empty = always, first value 0x141) with the T3 damage; conditional entries (counter
@@ -365,10 +367,30 @@ def build(m, costume, out_dir, template_slot=0):
             r = reactions(rea_t3)
             if r is not None:
                 seq[-1] = (seq[-1][0], seq[-1][1], r)
-        start = len(H)
-        for rq, d, rea in seq:
-            H.append(struct.pack(HITCOND, rq, max(1, round(dmg * d / base)) if dmg else 0, rea))
-        return start
+        body = tuple(struct.pack(HITCOND, rq, max(1, round(dmg * d / base)) if dmg else 0, rea)
+                     for rq, d, rea in seq)
+        if body not in hitcond_lists:                 # identical lists are shared
+            hitcond_lists[body] = len(H)
+            H.extend(body)
+        return hitcond_lists[body]
+
+    # requirement lists of the template that hold exactly one condition
+    R = [struct.unpack("<HH", e) for e in com.lists["requirement"]]
+    req_list = {}
+    for k in range(len(R) - 1):
+        if R[k + 1][0] == REQ_END and (k == 0 or R[k - 1][0] == REQ_END) and R[k][1] == 0:
+            req_list.setdefault(R[k][0], k)
+
+    def t5_reqs(req):
+        """T5 requirement list indices for a T3 cancel requirement (one T5 entry each), None if
+        it has no T5 equivalent yet. T3 FUN_8002e0bc: 26 = contact not guarded (on hit, T5 40),
+        1 = contact (hit or block: T5 40 and 41)."""
+        if req in REQ_NONE:
+            return [0]
+        t5 = {26: (40,), 1: (40, 41)}.get(req) or ((REQ_T3_T5[req],) if req in REQ_T3_T5 else ())
+        if not t5 or any(x not in req_list for x in t5):
+            return None
+        return [req_list[x] for x in t5]
 
     def clone(tmove, t3idx, dmg):
         """New move = template attack `tmove` with T3 move `t3idx` (animation, damage, active
@@ -398,14 +420,20 @@ def build(m, costume, out_dir, template_slot=0):
         entries = []
         for _, e in ms.cancels(ms.own, ms.own.move(t3idx)[3]):
             cmd, cond, req, _, tgt, _, fr0, fr1, st = e
-            if cmd >= 0xC000 or cond not in FREE_ATTACK or req not in REQ_NONE:
+            rqs = t5_reqs(req)
+            if cmd >= 0xC000 or cond not in FREE_ATTACK or rqs is None:
                 continue
             if cmd == 0x10:
-                # automatic continuation in a frame window (multi-part moves): T5 command 0
+                # automatic continuation in a frame window (multi-part moves): T5 command 0;
+                # T3 "on hit" / "on contact" become T5 requirement lists (one entry each)
                 a = own_move(tgt)
                 if a is not None:
-                    entries.append(struct.pack(CANCEL, 0, 0, clone(tmove, *a), 0,
-                                               max(fr0, 1), fr1, max(st, 1), 0))
+                    child = clone(tmove, *a)
+                    for rq in rqs:
+                        entries.append(struct.pack(CANCEL, 0, rq, child, 0,
+                                                   max(fr0, 1), fr1, max(st, 1), 0))
+                continue
+            if rqs != [0]:
                 continue
             if not cmd & 0xF:
                 # direction only (held): landings, rolls, stance changes inside a move
@@ -442,7 +470,10 @@ def build(m, costume, out_dir, template_slot=0):
                     mv["transition"] = follow
                 entries.append(struct.pack(CANCEL, *f))
                 break
-            if not (f[0] >> 16) & 0xFF:
+            # of the template's own entries only the special commands stay (0x8001.. dash,
+            # sidestep, groups ...): its direction-only and automatic (on hit ...) transitions
+            # are the template move's, T3's own are above
+            if 0x8000 < f[0] < 0x10000:
                 entries.append(e)
         start = len(com.lists["cancel"])
         com.lists["cancel"].extend(entries)
@@ -516,12 +547,6 @@ def build(m, costume, out_dir, template_slot=0):
 
     pairs = {stand: 0}
     n_added = 0
-    # requirement lists of the template that hold exactly one condition (T5 side conditions)
-    R = [struct.unpack("<HH", e) for e in com.lists["requirement"]]
-    req_list = {}
-    for k in range(len(R) - 1):
-        if R[k + 1][0] == REQ_END and (k == 0 or R[k - 1][0] == REQ_END) and R[k][1] == 0:
-            req_list.setdefault(R[k][0], k)
     queue = [stand]
     n_states = 0
     while queue:
@@ -566,6 +591,36 @@ def build(m, costume, out_dir, template_slot=0):
         if j != stand:
             set_anim(j, st3)
         n_states += 1
+
+    # second pass, all pairs known: the states' T3 direction-only entries to moves that are no
+    # T5 state themselves (rolls, landings, special steps) go in front of the T5 movement entries
+    paired_t3 = set(pairs.values())
+    attack_tmpl = next(iter(tmpl_of.values()))
+    for j, st3 in pairs.items():
+        front = []
+        for _, e in ms.cancels(ms.own, ms.own.move(st3)[3]):
+            cmd, cond, req, _, tgt, _, fr0, fr1, st = e
+            if cmd >= 0xC000 or cmd & 0xF or cmd == 0x10 or cond not in FREE_ATTACK or req not in REQ_NONE:
+                continue
+            a = own_move(tgt)
+            if a is None or a[0] <= 1 or a[0] in paired_t3 or resting(a[0]):
+                continue
+            tm = attack_tmpl if ms.own.move_bytes(a[0])[0x2D] else stand
+            front.append(struct.pack(CANCEL, t5_key(cmd)[0], 0, clone(tm, *a), 0,
+                                     max(fr0, 1), fr1, max(st, 1), 0))
+        if front:
+            mv = com.move(j)
+            k = mv["cancel"]
+            old = []
+            while True:
+                old.append(com.lists["cancel"][k])
+                if struct.unpack_from("<I", com.lists["cancel"][k])[0] == 0x8000:
+                    break
+                k += 1
+            mv["cancel"] = len(com.lists["cancel"])
+            com.lists["cancel"].extend(front + old)
+            com.lists["move"][j] = com.pack_move(mv)
+            n_added += len(front)
 
     # Dr. B's gimmick (T3 moveset, model 38/39): he cannot stay on his feet. Standing with no
     # direction held: T3 131 (stands 20 frames) -> 237 (falls, 30) -> 269 (20) -> 266 (lies, a
@@ -735,6 +790,12 @@ def build(m, costume, out_dir, template_slot=0):
     # the game keeps both players' movesets in 938368 bytes, merge/data/ram.csv splits them so
     # that every character but King gets 447872 on either side. Drop the template moves the
     # clones replaced and their cancel lists (indices in states.txt / clones.txt are from before).
+    # the template's attacks also sit in the shared group lists (0x8005), reached from states
+    # that are not T3 states: out with them too (1:1 T3; generic Co_ / Thr moves stay)
+    n_grp = com.drop_group_entries(
+        lambda f: not 0x8000 <= f[0] < 0x10000 and f[2] < n_template
+        and com.move(f[2])["active_start"] and not keep(f[2]))
+    print(f"template attacks dropped from groups: {n_grp}")
     dead = com.remove_dead_moves()
     com.compact_cancels()
     anims = drop_unused_animations(com, anims)
