@@ -115,11 +115,10 @@ def anim_source(m, move):
     return d, an + o
 
 
-def convert(m, move, skel):
+def convert(m, move, skel, common=False):
     """T5 animation bytes (format 0x64) of T3 model m's move `move`; None for animations from the
-    common pack (TOC 279 decoded for Gon's stand gave a torn-apart body in the game: unclear
-    whether all characters' common values refer to that pack - not converted)."""
-    if struct.unpack_from("<I", pack(m)[0], pack(m)[2] + 56 * move)[0] >= 0x40000000:
+    common pack (TOC 279) unless `common`."""
+    if not common and struct.unpack_from("<I", pack(m)[0], pack(m)[2] + 56 * move)[0] >= 0x40000000:
         return None
     d, a = anim_source(m, move)
     an, o = a, 0
@@ -167,10 +166,11 @@ if __name__ == "__main__":
     from t5_posetest import render, world
     t5 = open(Path(__file__).resolve().parent.parent / "merge/extracted/tk5data1/0240.bin", "rb").read()
     blk, _ = fit_skeleton(t5, m)
-    costume = Path(__file__).resolve().parent.parent / {22: "merge/data/ogre/model.bin"}.get(m, "merge/data/ogre/model.bin")
+    names = {22: "ogre", 26: "trueogre", 28: "gunjack", 36: "gon", 38: "drb"}
+    costume = Path(__file__).resolve().parent.parent / f"merge/data/{names.get(m, 'ogre')}/model.bin"
     cd = open(costume, "rb").read()
     skel = skeleton_of(cd)
-    anim = convert(m, move, skel)
+    anim = convert(m, move, skel, common=True)
     par, tr, ro = skel
     Wb = world(par, tr, ro, {})
     p = decode_frame(anim, 10)

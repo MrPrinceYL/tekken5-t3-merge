@@ -252,11 +252,11 @@ def build(m, costume, out_dir, template_slot=0):
     t3_anim = {}                                      # T3 move -> bank index
 
     def own_anim(t3idx, victim=False):
-        """Bank animation id of T3 move t3idx (None: common-pack animation, not converted).
+        """Bank animation id of T3 move t3idx (own or common T3 pack).
         Throw victims are retargeted to a standard T5 skeleton (Paul's): any character."""
         key = (t3idx, victim)
         if key not in t3_anim:
-            a = conv.convert(m, t3idx, victim_skel if victim else skel)
+            a = conv.convert(m, t3idx, victim_skel if victim else skel, common=True)
             if a is None:
                 t3_anim[key] = None
             else:
