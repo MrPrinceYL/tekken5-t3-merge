@@ -26,8 +26,18 @@ fehlerfrei in T5. Jede Stufe erst im Spiel prüfen (headless + Bild), dann notie
       Laden des Kampfs). Für alle fünf angewendet (Ogre ×1,04, True Ogre ×0,99, Gun Jack ×0,875
       gegen Jack-5, Dr. B ×0,86/0,9). Im Fenster geprüft, auch getroffen/am Boden. Treffer-
       kugeln folgen dem Skelett → hohe Angriffe gehen über Gon (Spieltest Nutzer offen).
-- [ ] **P2 Gimmick Dr. B (nur Dr. B):** kann nicht lange stehen (Rücken) – T3-Stand-Kette
-      (Stand → Umfallen/Liegen nach Zeit) und Bodenspiel aus dem T3-Moveset übernehmen.
+- [x] **P2 Gimmick Dr. B (20.10.):** steckt im T3-Moveset (kein Code): Stand-Moves 0/1/2/3
+      haben „neutral gehalten“ → 131 (20 Frames stehen) → 237 (fällt, 30, vuln 0x3884 = liegend)
+      → 269 (20) → 266 (Liegeschleife mit Bodenangriffen 3, 4, 3+4, 1+2 …). Umsetzung im
+      Konverter: Klone mit T3-Animation + T3-Folgeangriffen, Vorlagen `dwDWN_00U` (Fallen) /
+      `dwKAM_00U` (Liegen, T5-Aufstehoptionen), vuln der Vorlage statt 0x3884, verkettet über
+      Ende-Eintrag + transition; im Stand ein Eintrag 0x20 (neutral) → 131 hinter allen anderen.
+      Fenstertest: ohne Eingabe liegt Dr. B ab Rundenbeginn, wird am Boden getroffen.
+      Offen (Nutzertest): Richtung halten hält ihn stehend, Bodenangriffe per Taste.
+- **Voraussetzung beider Gimmicks (20.10.):** Animationen aus dem gemeinsamen T3-Paket (TOC 279)
+  werden jetzt übernommen (`convert(common=True)`); der „zerrissene Gon-Stand“ kam von der
+  fehlenden Größenskalierung. T3-Charakter-IDs (Tabelle 0x800958C4, Wert = m + 6): Ogre 14,
+  Gun Jack 16, Gon 17, Dr. B 19, True Ogre 20.
 - [ ] **P3 Füße verbuggt** (Nutzer 13.10.) – Ursache finden (Skinning/Retargeting/geteilte Ressource).
 - [ ] **P4 True Ogre Schlangenhand + Schwanz bewegt** (Sekundärbewegung FUN_80037cbc als Animation).
 - [ ] **P5 Moveset 1:1 Rest:** übrige T3-Requirements/bedingte Ketten, Intros, Reaktionen ohne

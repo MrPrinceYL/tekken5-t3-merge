@@ -216,6 +216,7 @@ def t5_bank_anims(data):
 
 # T3 model -> T3 character id (table 0x800958C4: four model slots per character, value = m + 6).
 GON_MODELS = (36, 37)
+DRB_MODELS = (38, 39)
 STAND_VULN = (0x0842, 0x1052, 0x1952)
 
 
@@ -451,6 +452,50 @@ def build(m, costume, out_dir, template_slot=0):
         if j != stand:
             set_anim(j, st3)
         n_states += 1
+
+    # Dr. B's gimmick (T3 moveset, model 38/39): he cannot stay on his feet. Standing with no
+    # direction held: T3 131 (stands 20 frames) -> 237 (falls, 30) -> 269 (20) -> 266 (lies, a
+    # loop with his ground attacks); holding a direction or attacking keeps him up. Ported as
+    # clones (T3 animation and button follow-ups) of T5 lying moves (their vulnerability and
+    # get-up options; T3 lying = 0x3884), linked by end entry and transition.
+    n_drb = 0
+    if m in DRB_MODELS:
+        by_name = {com.name(com.move(i)["name"]): i for i in range(n_template)}
+
+        def chain_move(tmpl, t3idx, nxt):
+            keep_vuln = com.move(tmpl)["vuln"]
+            new = clone(tmpl, t3idx, 0)
+            mv = com.move(new)
+            if ms.own.move(t3idx)[1] & 0xFFFF == 0x3884:
+                mv["vuln"] = keep_vuln
+            mv["transition"] = nxt
+            for k in range(mv["cancel"], len(com.lists["cancel"])):
+                f = list(struct.unpack(CANCEL, com.lists["cancel"][k]))
+                if f[0] == 0x8000:
+                    f[2] = nxt
+                    com.lists["cancel"][k] = struct.pack(CANCEL, *f)
+                    break
+            com.lists["move"][new] = com.pack_move(mv)
+            return new
+
+        lie = clone(by_name["dwKAM_00U"], 266, 0)
+        lie = chain_move(by_name["dwKAM_00U"], 266, lie)          # loops on itself
+        down = chain_move(by_name["dwDWN_00U"], 269, lie)
+        fall = chain_move(by_name["dwDWN_00U"], 237, down)
+        still = chain_move(stand, 131, fall)
+        mv = com.move(stand)
+        entries = com.lists["cancel"]
+        k = mv["cancel"]
+        while struct.unpack(CANCEL, entries[k])[0] != 0x8000:
+            k += 1
+        # neutral held (T5 direction 0x20), after every other entry; like the walks' entries
+        entries.insert(k, struct.pack(CANCEL, 0x20, 0, still, 14, 1, 255, 1, 0))
+        for i in range(len(com.lists["move"])):          # lists behind the insertion shift
+            mi = com.move(i)
+            if mi["cancel"] > k:
+                mi["cancel"] += 1
+                com.lists["move"][i] = com.pack_move(mi)
+        n_drb = 4
 
     # throws: T5 attempt (1+3 / 2+4) -> executions by side requirement (same ids as T3's:
     # 2 front, 3 back, 4/5 sides, parameter 1536); execution = thrower move `*_n` whose hit
