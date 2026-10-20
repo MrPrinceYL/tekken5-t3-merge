@@ -12,7 +12,7 @@
 
 use crate::{bus, diag, dmac, Machine};
 use std::collections::VecDeque;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 pub struct Ipu {
     pub ctrl: u32,
@@ -31,6 +31,8 @@ pub struct Ipu {
     /// Bit position in the front qword.
     pub bp: u32,
     pub out: VecDeque<u128>,
+    /// Quantiser matrices as transmitted (zigzag order), applied by scan position like the
+    /// hardware (PCSX2 IPU_MultiISA quant_matrix[i]), also for the alternate scan.
     pub iq_intra: [u8; 64],
     pub iq_non: [u8; 64],
     pub vqclut: [u16; 16],
@@ -153,6 +155,11 @@ impl Vlc {
     }
     fn get(&self, b: &mut Bits) -> Result<i32, NeedData> {
         let (v, l) = self.t[b.peek16() as usize];
+        // peek16 pads with zeros past the data the IPU has: a code cut there decodes as
+        // another or none. Wait for input then (the hardware stalls), as for any other read.
+        if (l == 0 || l as usize > b.avail()) && b.avail() < 16 {
+            return Err(NeedData);
+        }
         if l == 0 {
             return Ok(i32::MIN);
         }
@@ -246,20 +253,19 @@ fn tables() -> &'static Tables {
             ("00100101", rl(1, 3)), ("00100100", rl(3, 2)), ("00100111", rl(10, 1)), ("00100011", rl(11, 1)),
             ("00100010", rl(12, 1)), ("00100000", rl(13, 1)), ("0000001010", rl(0, 7)), ("0000001100", rl(1, 4)),
             ("0000001011", rl(2, 3)), ("0000001111", rl(4, 2)), ("0000001001", rl(5, 2)), ("0000001110", rl(14, 1)),
-            ("0000001101", rl(15, 1)), ("0000001000", rl(16, 1)), ("000000011101", rl(0, 8)),
-            ("000000011000", rl(0, 9)), ("000000010011", rl(0, 10)), ("000000010000", rl(0, 11)),
-            ("000000011011", rl(1, 5)), ("000000010100", rl(2, 4)), ("000000011100", rl(3, 3)),
+            ("0000001101", rl(15, 1)), ("0000001000", rl(16, 1)), ("000000011100", rl(3, 3)),
             ("000000010010", rl(4, 3)), ("000000011110", rl(6, 2)), ("000000010101", rl(7, 2)),
             ("000000010001", rl(8, 2)), ("000000011111", rl(17, 1)), ("000000011010", rl(18, 1)),
             ("000000011001", rl(19, 1)), ("000000010111", rl(20, 1)), ("000000010110", rl(21, 1)),
-            ("0000000011010", rl(0, 12)), ("0000000011001", rl(0, 13)), ("0000000011000", rl(0, 14)),
-            ("0000000010111", rl(0, 15)), ("0000000010110", rl(1, 6)), ("0000000010101", rl(1, 7)),
+            ("0000000010110", rl(1, 6)), ("0000000010101", rl(1, 7)),
             ("0000000010100", rl(2, 5)), ("0000000010011", rl(3, 4)), ("0000000010010", rl(5, 3)),
             ("0000000010001", rl(9, 2)), ("0000000010000", rl(10, 2)), ("0000000011111", rl(22, 1)),
             ("0000000011110", rl(23, 1)), ("0000000011101", rl(24, 1)), ("0000000011100", rl(25, 1)),
             ("0000000011011", rl(26, 1)),
         ];
         let long: Vec<(&str, i32)> = vec![
+            // Shared with B-15 (libmpeg2 / PCSX2 tab2..tab3).
+            ("0000000010111", rl(0, 15)), ("0000000011000", rl(0, 14)), ("0000000011001", rl(0, 13)), ("0000000011010", rl(0, 12)), ("000000010000", rl(0, 11)), ("000000010011", rl(0, 10)), ("000000010100", rl(2, 4)), ("000000011000", rl(0, 9)), ("000000011011", rl(1, 5)), ("000000011101", rl(0, 8)),
             ("00000000011111", rl(0, 16)), ("00000000011110", rl(0, 17)), ("00000000011101", rl(0, 18)),
             ("00000000011100", rl(0, 19)), ("00000000011011", rl(0, 20)), ("00000000011010", rl(0, 21)),
             ("00000000011001", rl(0, 22)), ("00000000011000", rl(0, 23)), ("00000000010111", rl(0, 24)),
@@ -333,41 +339,53 @@ const NONLINEAR_Q: [i32; 32] = [
     0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 18, 20, 22, 24, 28, 32, 36, 40, 44, 48, 52, 56, 64, 72, 80, 88, 96, 104, 112,
 ];
 
-fn idct_basis() -> &'static [[f64; 8]; 8] {
-    static B: OnceLock<[[f64; 8]; 8]> = OnceLock::new();
-    B.get_or_init(|| {
-        let mut b = [[0f64; 8]; 8];
-        for (x, row) in b.iter_mut().enumerate() {
-            for (u, v) in row.iter_mut().enumerate() {
-                let c = if u == 0 { (0.5f64).sqrt() } else { 1.0 };
-                *v = c * ((2 * x + 1) as f64 * u as f64 * std::f64::consts::PI / 16.0).cos() / 2.0;
-            }
-        }
-        b
-    })
-}
-
-/// Separable double-precision 8x8 inverse DCT (IEEE 1180 accurate), rounded.
+/// PCSX2 IDCT_Block (mpeg2dec integer IDCT, row pass into 16 bits, then columns), on a block
+/// in natural order; the result is spatial, natural order.
 fn idct(blk: &[i32; 64]) -> [i32; 64] {
-    let b = idct_basis();
-    let mut tmp = [0f64; 64];
-    for v in 0..8 {
-        for x in 0..8 {
-            let mut s = 0.0;
-            for u in 0..8 {
-                s += b[x][u] * blk[v * 8 + u] as f64;
-            }
-            tmp[v * 8 + x] = s;
+    const W1: i32 = 2841;
+    const W2: i32 = 2676;
+    const W3: i32 = 2408;
+    const W5: i32 = 1609;
+    const W6: i32 = 1108;
+    const W7: i32 = 565;
+    // Coefficient order of PCSX2's packed scan within a row / column.
+    const P: [usize; 8] = [0, 2, 4, 6, 1, 3, 5, 7];
+    fn bf(w0: i32, w1: i32, d0: i32, d1: i32) -> (i32, i32) {
+        let tmp = w0 * (d0 + d1);
+        (tmp + (w1 - w0) * d1, tmp - (w1 + w0) * d0)
+    }
+    let mut t = [0i16; 64];
+    for r in 0..8 {
+        let g = |k: usize| blk[r * 8 + P[k]];
+        let (d0, d2) = ((g(0) << 11) + 128, g(2) << 11);
+        let (t0, t1) = (d0 + d2, d0 - d2);
+        let (t2, t3) = bf(W6, W2, g(3), g(1));
+        let a = [t0 + t2, t1 + t3, t1 - t3, t0 - t2];
+        let (t0, t1) = bf(W7, W1, g(7), g(4));
+        let (t2, t3) = bf(W3, W5, g(5), g(6));
+        let (b0, b3) = (t0 + t2, t1 + t3);
+        let (t0, t1) = (t0 - t2, t1 - t3);
+        let b = [b0, ((t0 + t1) * 181) >> 8, ((t0 - t1) * 181) >> 8, b3];
+        for k in 0..4 {
+            t[r * 8 + k] = ((a[k] + b[k]) >> 8) as i16;
+            t[r * 8 + 7 - k] = ((a[k] - b[k]) >> 8) as i16;
         }
     }
     let mut out = [0i32; 64];
     for x in 0..8 {
-        for y in 0..8 {
-            let mut s = 0.0;
-            for v in 0..8 {
-                s += b[y][v] * tmp[v * 8 + x];
-            }
-            out[y * 8 + x] = s.round() as i32;
+        let g = |k: usize| t[P[k] * 8 + x] as i32;
+        let (d0, d2) = ((g(0) << 11) + 65536, g(2) << 11);
+        let (t0, t1) = (d0 + d2, d0 - d2);
+        let (t2, t3) = bf(W6, W2, g(3), g(1));
+        let a = [t0 + t2, t1 + t3, t1 - t3, t0 - t2];
+        let (t0, t1) = bf(W7, W1, g(7), g(4));
+        let (t2, t3) = bf(W3, W5, g(5), g(6));
+        let (b0, b3) = (t0 + t2, t1 + t3);
+        let (t0, t1) = ((t0 - t2) >> 8, (t1 - t3) >> 8);
+        let b = [b0, (t0 + t1) * 181, (t0 - t1) * 181, b3];
+        for k in 0..4 {
+            out[k * 8 + x] = ((a[k] + b[k]) >> 17) as i16 as i32;
+            out[(7 - k) * 8 + x] = ((a[k] - b[k]) >> 17) as i16 as i32;
         }
     }
     out
@@ -404,15 +422,18 @@ impl Ipu {
         let table = if intra && self.ctrl & (1 << 21) != 0 { &t.b15 } else { &t.b14 };
         let iq = if intra { self.iq_intra } else { self.iq_non };
         let mut first = !intra;
-        let mut sum = c[0];
         loop {
             let v = if first { t.b14_first.get(b)? } else { table.get(b)? };
             first = false;
             if v == EOB {
                 break;
             }
-            let (run, mut level);
+            // PCSX2 get_intra_block / get_non_intra_block: table codes are scaled by magnitude
+            // and the sign applied afterwards (rounds towards 0); escapes are scaled signed and
+            // shifted (rounds down).
+            let (run, level, neg);
             if v == ESC {
+                neg = false;
                 run = b.get(6)? as i32;
                 if mpeg1 {
                     let l = b.get(8)? as i32;
@@ -430,32 +451,29 @@ impl Ipu {
             } else {
                 run = v >> 16;
                 level = v & 0xFFFF;
-                if b.get(1)? == 1 {
-                    level = -level;
-                }
+                neg = b.get(1)? == 1;
             }
             i += run as usize;
             if i > 63 {
                 break;
             }
             let j = scan[i];
-            let w = iq[j] as i32;
+            let w = iq[i] as i32;
             let mut val = if intra {
                 if mpeg1 { (level * q * w) >> 3 } else { (level * q * w) >> 4 }
             } else {
-                let s = if level > 0 { 1 } else { -1 };
-                if mpeg1 { ((2 * level + s) * q * w) >> 4 } else { ((2 * level + s) * q * w) / 32 }
+                let s = if level >= 0 { 1 } else { -1 };
+                if mpeg1 { ((2 * level + s) * q * w) >> 4 } else { ((2 * level + s) * q * w) >> 5 }
             };
             if mpeg1 && val != 0 && val & 1 == 0 {
                 val -= val.signum();
             }
+            if neg {
+                val = -val;
+            }
             val = val.clamp(-2048, 2047);
             c[j] = val;
-            sum += val;
             i += 1;
-        }
-        if !mpeg1 && sum & 1 == 0 {
-            c[63] ^= 1;
         }
         Ok(c)
     }
@@ -486,7 +504,7 @@ impl Ipu {
                 for y in 0..8 {
                     for x in 0..8 {
                         let v = pix[y * 8 + x];
-                        let v = if intra { v.clamp(0, 255) } else { v.clamp(-256, 255) };
+                        let v = if intra { v.clamp(0, 255) } else { v };
                         let (o, stride) = if blk < 4 {
                             let bx = (blk & 1) * 8;
                             let row = if dt { (blk >> 1) + 2 * y } else { (blk >> 1) * 8 + y };
@@ -499,6 +517,9 @@ impl Ipu {
                     }
                 }
             }
+            // Done only once the 32 bits after the macroblock are in (TOP valid), as PCSX2
+            // mpeg2_slice; libmpeg reads its next fields from TOP.
+            b.peek(32)?;
             Ok(())
         })();
         if let Err(e) = res {
@@ -509,12 +530,14 @@ impl Ipu {
         Ok(out)
     }
 
+    /// The IPU's integer YCbCr -> RGB (PCSX2 yuv2rgb_reference, "the precise documented integer
+    /// method used by the hardware") and the TH0 / TH1 alpha thresholds (PCSX2 ipu_csc).
     fn rgb(&self, y: i32, cb: i32, cr: i32) -> (u8, u8, u8, u8) {
-        let yy = 1.164 * (y - 16) as f64;
-        let (cb, cr) = ((cb - 128) as f64, (cr - 128) as f64);
-        let r = (yy + 1.596 * cr).round().clamp(0.0, 255.0) as u32;
-        let g = (yy - 0.813 * cr - 0.391 * cb).round().clamp(0.0, 255.0) as u32;
-        let bl = (yy + 2.018 * cb).round().clamp(0.0, 255.0) as u32;
+        let lum = (0x95 * (y - 16).max(0)) >> 6;
+        let (cb, cr) = (cb - 128, cr - 128);
+        let r = ((lum + ((0xCC * cr) >> 6) + 1) >> 1).clamp(0, 255) as u32;
+        let g = ((lum + ((-0x68 * cr) >> 6) + ((-0x32 * cb) >> 6) + 1) >> 1).clamp(0, 255) as u32;
+        let bl = ((lum + ((0x102 * cb) >> 6) + 1) >> 1).clamp(0, 255) as u32;
         let a = if r < self.th0 && g < self.th0 && bl < self.th0 {
             0
         } else if r < self.th1 && g < self.th1 && bl < self.th1 {
@@ -525,9 +548,12 @@ impl Ipu {
         if a == 0 { (0, 0, 0, 0) } else { (r as u8, g as u8, bl as u8, a) }
     }
 
-    /// CSC: `count` RAW8 macroblocks (384 bytes each, read raw from the input) to RGB32 / RGB16.
+    /// CSC: `count` RAW8 macroblocks (384 bytes each, read raw from the input) to RGB32 / RGB16
+    /// (OFM, dithered with DTE: PCSX2 ipu_dither_reference).
     fn csc(&mut self, b: &mut Bits, cmd: u32) -> Result<Vec<u128>, NeedData> {
+        const DITHER: [[i32; 4]; 4] = [[-4, 0, -3, 1], [2, -2, 3, -1], [-3, 1, -4, 0], [3, -1, 2, -2]];
         let count = (cmd & 0x7FF) as usize;
+        let dte = cmd & (1 << 26) != 0;
         let rgb16 = cmd & (1 << 27) != 0;
         let mut out = Vec::new();
         for _ in 0..count {
@@ -544,8 +570,10 @@ impl Ipu {
             }
             if rgb16 {
                 let mut bytes = Vec::with_capacity(512);
-                for (r, g, bl, a) in px {
-                    let v = (r as u16 >> 3) | ((g as u16 >> 3) << 5) | ((bl as u16 >> 3) << 10) | (((a != 0) as u16) << 15);
+                for (k, (r, g, bl, a)) in px.into_iter().enumerate() {
+                    let d = if dte { DITHER[(k / 16) & 3][k & 3] } else { 0 };
+                    let q = |c: u8| ((c as i32 + d).clamp(0, 255) >> 3) as u16;
+                    let v = q(r) | (q(g) << 5) | (q(bl) << 10) | (((a == 0x40) as u16) << 15);
                     bytes.extend_from_slice(&v.to_le_bytes());
                 }
                 out.extend(bytes.chunks(16).map(|c| u128::from_le_bytes(c.try_into().unwrap())));
@@ -566,6 +594,7 @@ impl Ipu {
             // BCLR: clear the input FIFO (the rest of the DMA transfer stays), set BP.
             self.fifo.clear();
             self.bp = cmd & 0x7F;
+            trace(cmd, 0, &[], "");
             return Ok(0);
         }
         if op == 9 {
@@ -573,6 +602,11 @@ impl Ipu {
             self.th1 = (cmd >> 16) & 0x1FF;
             return Ok(0);
         }
+        // T5_IPUTRACE: the state a BDEC starts from (modes, DC predictors, matrices, BP).
+        let pre = (op == 2 && trace_on()).then(|| {
+            let h = |m: &[u8; 64]| m.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
+            format!(" ctrl {:08x} dc {:?} iq {:016x} {:016x} bp {}", self.ctrl & 0x07F3_0000, self.dc_pred, h(&self.iq_intra), h(&self.iq_non), self.bp)
+        });
         // Run on a view of the stream; the caller commits the consumed bits.
         let mut b = Bits { q: &q, pos: self.bp as usize };
         let mut result_out: Vec<u128> = Vec::new();
@@ -584,18 +618,41 @@ impl Ipu {
             }
             3 => {
                 b.skip((cmd & 0x3F) as usize)?;
+                // DATA as PCSX2 ipuVDEC: value | code length << 16, the value sign-extended over
+                // the whole word (motion codes, DMV); macroblock types of I / P pictures without
+                // the length, P / B with MC_FRAME (frame_pred_frame_dct = 1, frame pictures).
                 let start = b.pos;
-                let v = match (cmd >> 26) & 3 {
+                let tbl = (cmd >> 26) & 3;
+                let pct = ((self.ctrl >> 24) & 7).clamp(1, 4);
+                let mpeg1 = self.ctrl & (1 << 23) != 0;
+                let v = match tbl {
                     0 => t.mbai.get(&mut b)?,
-                    1 => {
-                        let pct = ((self.ctrl >> 24) & 7).clamp(1, 4) as usize;
-                        t.mbt[pct - 1].get(&mut b)?
-                    }
+                    1 => t.mbt[pct as usize - 1].get(&mut b)?,
                     2 => t.mc.get(&mut b)?,
                     _ => t.dmv.get(&mut b)?,
                 };
-                let len = (b.pos - start) as u32;
-                self.cmd_data = (v as u32 & 0xFFFF) | (len << 16);
+                let len = (b.pos - start) as i32;
+                let data = if v == i32::MIN || (tbl == 0 && v == 0x22 && !mpeg1) {
+                    // Invalid code (or MPEG-1 stuffing in an MPEG-2 stream): an error, nothing used.
+                    b.pos = start;
+                    0
+                } else {
+                    match tbl {
+                        1 => match pct {
+                            1 => v,
+                            2 => v | if v & 8 != 0 { 0x80 } else { 0 },
+                            3 => v | 0x80 | len << 16,
+                            _ => v | len << 16,
+                        },
+                        // The sign bit is not counted.
+                        2 if v != 0 => v | (len - 1) << 16,
+                        _ => v | len << 16,
+                    }
+                };
+                // As PCSX2 ipuVDEC: busy until the 32 bits after the code are in (TOP valid).
+                b.peek(32)?;
+                self.cmd_data = data as u32;
+                self.ctrl = (self.ctrl & !(1 << 14)) | ((data == 0) as u32) << 14;
             }
             4 => {
                 b.skip((cmd & 0x3F) as usize)?;
@@ -611,8 +668,8 @@ impl Ipu {
                 b.skip((cmd & 0x3F) as usize)?;
                 if op == 5 {
                     let mut m = [0u8; 64];
-                    for i in 0..64 {
-                        m[ZIGZAG[i]] = b.get(8)? as u8;
+                    for v in m.iter_mut() {
+                        *v = b.get(8)? as u8;
                     }
                     if cmd & (1 << 27) != 0 { self.iq_non = m } else { self.iq_intra = m }
                 } else {
@@ -635,8 +692,68 @@ impl Ipu {
         let b_pos = b.pos;
         drop(b);
         self.bp = (b_pos % 128) as u32;
+        if op == 2 || op == 3 {
+            trace(cmd, self.cmd_data, &result_out, pre.as_deref().unwrap_or(""));
+        }
         self.out.extend(result_out);
         Ok(b_pos / 128)
+    }
+}
+
+/// `T5_IPUDUMP=<file>`: every qword the decoding commands consume, in order (the stream the
+/// game feeds the IPU), for decoding the same data in `tests::mpeg_stream_sync` (T5_MPEG_ES).
+/// `T5_IPUCSC=<file>`: the CSC input (the pictures libmpeg reconstructed, RAW8 macroblocks), to
+/// compare with that decode (T5_MPEG_RAW).
+fn dump_in(v: u128, csc: bool) {
+    use std::io::Write;
+    type Sink = OnceLock<Option<Mutex<std::io::BufWriter<std::fs::File>>>>;
+    static FILES: [Sink; 2] = [OnceLock::new(), OnceLock::new()];
+    let Some(f) = FILES[csc as usize].get_or_init(|| {
+        let path = std::env::var(if csc { "T5_IPUCSC" } else { "T5_IPUDUMP" }).ok()?;
+        Some(Mutex::new(std::io::BufWriter::with_capacity(1 << 16, std::fs::File::create(path).ok()?)))
+    }) else { return };
+    let _ = f.lock().unwrap().write_all(&v.to_le_bytes());
+}
+
+/// `T5_IPUTRACE=<file>`: every BCLR, VDEC (result) and BDEC (hash of its output), one line each,
+/// so a game run can be compared with the decode of the same stream in `tests::mpeg_stream_sync`
+/// (which writes the same lines through this function when the variable is set).
+fn trace_text(line: String) {
+    trace(u32::MAX, 0, &[], &line);
+}
+
+fn trace_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("T5_IPUTRACE").is_some())
+}
+
+fn trace(cmd: u32, data: u32, out: &[u128], pre: &str) {
+    use std::io::Write;
+    static FILE: OnceLock<Option<Mutex<(std::io::BufWriter<std::fs::File>, u32)>>> = OnceLock::new();
+    let Some(f) = FILE.get_or_init(|| {
+        let path = std::env::var("T5_IPUTRACE").ok()?;
+        Some(Mutex::new((std::io::BufWriter::new(std::fs::File::create(path).ok()?), 0)))
+    }) else { return };
+    let mut g = f.lock().unwrap();
+    let line = if cmd == u32::MAX { pre.to_string() } else { match cmd >> 28 {
+        0 => format!("C {cmd:08x}
+"),
+        3 => format!("V {cmd:08x} {:04x}
+", data & 0xFFFF),
+        _ => {
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for b in out.iter().flat_map(|q| q.to_le_bytes()) {
+                h = (h ^ b as u64).wrapping_mul(0x100_0000_01b3);
+            }
+            format!("B {cmd:08x} {h:016x}{pre}
+")
+        }
+    } };
+    let _ = g.0.write_all(line.as_bytes());
+    g.1 += 1;
+    // Flushed at every BCLR (picture / stream boundaries) and every 1024 lines.
+    if g.1 % 1024 == 0 || cmd >> 28 == 0 || cmd == u32::MAX {
+        let _ = g.0.flush();
     }
 }
 
@@ -767,13 +884,18 @@ fn stream_into(m: &mut Machine, look: usize, q: &mut Vec<u128>) {
 }
 
 /// Consume `n` qwords of input: from the FIFO first, then from the transfer.
-fn commit(m: &mut Machine, n: usize) {
+/// `csc`: CSC input (else the decoded stream), for T5_IPUCSC / T5_IPUDUMP.
+fn commit(m: &mut Machine, n: usize, csc: bool) {
     let from_fifo = n.min(m.ipu.fifo.len());
-    m.ipu.fifo.drain(..from_fifo);
+    for v in m.ipu.fifo.drain(..from_fifo) {
+        dump_in(v, csc);
+    }
     if n > from_fifo {
         if let Some(mut c) = ToCursor::of(m) {
             for _ in from_fifo..n {
-                c.next(m);
+                if let Some(v) = c.next(m) {
+                    dump_in(v, csc);
+                }
             }
             c.store(m);
         }
@@ -796,11 +918,19 @@ pub fn read(m: &mut Machine, a: u32) -> u64 {
     match a & 0xF0 {
         0x00 => ipu.cmd_data as u64 | ((ipu.pending.is_some() as u64) << 63),
         0x10 => {
-            let ifc = ipu.fifo.len().saturating_sub(2).min(8) as u32;
+            // IFC as in IPU_BP (empty while a command waits for input).
+            let ifc = if ipu.pending.is_some() { 0 } else { ipu.fifo.len().saturating_sub(2).min(8) as u32 };
             let ofc = ipu.out.len().min(8) as u32;
             (ipu.ctrl & !0xFF & !(1 << 31)) as u64 | ifc as u64 | (ofc << 4) as u64 | ((ipu.pending.is_some() as u64) << 31)
         }
         0x20 => {
+            // A command waiting for input has used everything there is: the hardware decodes
+            // as data arrives, so its FIFO is empty then (libmpeg feeds more only when fewer
+            // than 32 bits are left, else it times out and ends the movie). Ours decodes a
+            // command at once, keeping the input until it completes.
+            if ipu.pending.is_some() {
+                return 0;
+            }
             let fp = ipu.fifo.len().min(2) as u32;
             let ifc = ipu.fifo.len().saturating_sub(2).min(8) as u32;
             (ipu.bp | ifc << 8 | fp << 16) as u64
@@ -826,15 +956,22 @@ pub fn write(m: &mut Machine, a: u32, v: u64) {
             run_pending(m);
         }
         0x10 => {
-            if v & (1 << 30) != 0 {
-                let keep = (m.ipu.iq_intra, m.ipu.iq_non);
-                m.ipu = Ipu::default();
-                m.ipu.iq_intra = keep.0;
-                m.ipu.iq_non = keep.1;
-                return;
-            }
-            let wmask = (3 << 16) | (1 << 20) | (1 << 21) | (1 << 22) | (1 << 23) | (7 << 24);
+            // As PCSX2 ipuWrite32: the mode bits (IDP, AS, IVF, QST, MP1, PCT) are written first,
+            // then RST resets the IPU keeping them (ctrl.reset: & 0x7F33F00). libmpeg sets the
+            // picture's modes in the same write as the reset.
+            let wmask = 0x07F3_0000;
             m.ipu.ctrl = (m.ipu.ctrl & !wmask) | (v as u32 & wmask);
+            if (m.ipu.ctrl >> 16) & 3 == 3 {
+                m.ipu.ctrl &= !(1 << 17); // invalid IDP: 9 bits
+            }
+            if v & (1 << 30) != 0 {
+                if crate::diag::enabled("T5_CDLOG") {
+                    crate::diag::log(format!("ipu reset at {}", m.now()));
+                }
+                let keep = (m.ipu.iq_intra, m.ipu.iq_non, m.ipu.ctrl & 0x07F3_3F00);
+                m.ipu = Ipu::default();
+                (m.ipu.iq_intra, m.ipu.iq_non, m.ipu.ctrl) = keep;
+            }
         }
         _ => {}
     }
@@ -856,12 +993,29 @@ fn run_pending(m: &mut Machine) {
             match m.ipu.exec(cmd, &q) {
                 Ok(n) => {
                     m.ipu.pending = None;
-                    commit(m, n);
+                    commit(m, n, cmd >> 28 == 7);
                     update_scd(m);
                     break;
                 }
                 Err(NeedData) => {
                     if q.len() < m.ipu.fifo.len() + look || look >= 1 << 17 {
+                        if crate::diag::enabled("T5_CDLOG") {
+                            crate::diag::log(format!("ipu waits for input at {} cmd {cmd:08x} has {} qw", m.now(), q.len()));
+                        }
+                        // The command has seen everything the transfer holds: on the hardware it
+                        // has pulled all of it in by now and IPU_TO is done (QWC 0). Take it into
+                        // the input buffer and end the transfer, so the program starts the next
+                        // one only then and nothing read ahead is lost when it does (libmpeg
+                        // otherwise times out on QWC != 0 and replaces the transfer).
+                        if let Some(mut c) = ToCursor::of(m) {
+                            while let Some(v) = c.next(m) {
+                                m.ipu.fifo.push_back(v);
+                            }
+                            c.store(m);
+                            if c.done() {
+                                dmac::finish(m, dmac::IPU_TO);
+                            }
+                        }
                         break; // waits for more input
                     }
                     look *= 4;
@@ -887,6 +1041,12 @@ pub fn fifo_write(m: &mut Machine, v: u128) {
 
 /// IPU_TO started: data flows into the FIFO as there is room.
 pub fn dma_start(m: &mut Machine) {
+    if trace_on() {
+        let (fifo, pend) = (m.ipu.fifo.len(), m.ipu.pending);
+        let ch = &m.dmac.ch[dmac::IPU_TO];
+        trace_text(format!("D start madr {:x} qwc {} fifo {fifo} pending {pend:x?}
+", ch.madr, ch.qwc));
+    }
     m.ipu.to_end = false;
     if crate::diag::enabled("T5_IPULOG") {
         let ch = &m.dmac.ch[dmac::IPU_TO];
@@ -914,5 +1074,461 @@ pub fn dma_from(m: &mut Machine) {
         dmac::finish(m, ch);
     } else {
         m.ipu.from_waiting = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Ipu;
+
+    /// The elementary video stream (PES id 0xE0) of the MPEG-2 program stream at `off` in the
+    /// disc image.
+    fn video_es(iso: &str, off: u64) -> Vec<u8> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = std::fs::File::open(iso).unwrap();
+        f.seek(SeekFrom::Start(off)).unwrap();
+        let mut d = vec![0u8; 64 << 20];
+        let n = f.read(&mut d).unwrap();
+        d.truncate(n);
+        let mut es = Vec::new();
+        let mut p = 0usize;
+        while p + 14 < d.len() && d[p..p + 3] == [0, 0, 1] {
+            let id = d[p + 3];
+            match id {
+                0xBA => p += 14 + (d[p + 13] & 7) as usize,
+                0xB9 => break,
+                _ => {
+                    let len = u16::from_be_bytes([d[p + 4], d[p + 5]]) as usize;
+                    if id == 0xE0 {
+                        let h = d[p + 8] as usize;
+                        es.extend_from_slice(&d[p + 9 + h..p + 6 + len]);
+                    }
+                    p += 6 + len;
+                }
+            }
+        }
+        es
+    }
+
+    /// One IPU command on the stream from qword `qpos` (the position the IPU's BP continues in).
+    /// The input arrives in pieces, as from the game's DMA transfers: 2 qwords, doubled while the
+    /// command needs more, so every command also meets the end of the data it has.
+    fn run(ipu: &mut Ipu, q: &[u128], qpos: &mut usize, cmd: u32) -> u32 {
+        let mut n = 2;
+        loop {
+            let end = (*qpos + n).min(q.len());
+            match ipu.exec(cmd, &q[*qpos..end]) {
+                Ok(k) => {
+                    *qpos += k;
+                    return ipu.cmd_data;
+                }
+                Err(_) if end < q.len() => n *= 2,
+                Err(_) => panic!("stream ran out"),
+            }
+        }
+    }
+
+    /// `n` plain bits: FDEC, then FDEC with FB = n to advance (as libmpeg reads fields).
+    fn read(ipu: &mut Ipu, q: &[u128], qpos: &mut usize, n: u32) -> u32 {
+        if n == 0 {
+            return 0;
+        }
+        let v = run(ipu, q, qpos, 4 << 28) >> (32 - n);
+        run(ipu, q, qpos, 4 << 28 | n);
+        v
+    }
+
+    /// A decoded picture, 4:2:0.
+    #[derive(Clone)]
+    struct Pic {
+        w: usize,
+        h: usize,
+        p: [Vec<u8>; 3],
+    }
+
+    impl Pic {
+        fn new(w: usize, h: usize) -> Pic {
+            Pic { w, h, p: [vec![0; w * h], vec![128; w * h / 4], vec![128; w * h / 4]] }
+        }
+        /// Half-pel prediction of a `bw` x `bh` block of plane `c` at full-pel (x, y) plus the
+        /// half-pel vector (MPEG-2 7.6.4).
+        fn pred(&self, c: usize, x: i32, y: i32, mvx: i32, mvy: i32, bw: usize, bh: usize) -> Vec<i32> {
+            let (pw, ph) = if c == 0 { (self.w, self.h) } else { (self.w / 2, self.h / 2) };
+            let px = |xx: i32, yy: i32| self.p[c][(yy.clamp(0, ph as i32 - 1) as usize) * pw + xx.clamp(0, pw as i32 - 1) as usize] as i32;
+            let (ix, iy, hx, hy) = (x + (mvx >> 1), y + (mvy >> 1), mvx & 1, mvy & 1);
+            let mut out = Vec::with_capacity(bw * bh);
+            for j in 0..bh as i32 {
+                for i in 0..bw as i32 {
+                    let (a, b, c2, d) = (px(ix + i, iy + j), px(ix + i + 1, iy + j), px(ix + i, iy + j + 1), px(ix + i + 1, iy + j + 1));
+                    out.push(match (hx, hy) {
+                        (0, 0) => a,
+                        (1, 0) => (a + b + 1) >> 1,
+                        (0, _) => (a + c2 + 1) >> 1,
+                        _ => (a + b + c2 + d + 2) >> 2,
+                    });
+                }
+            }
+            out
+        }
+    }
+
+    /// Default intra quantiser matrix (MPEG-2 6.3.11), natural order.
+    const DEFAULT_INTRA: [u8; 64] = [
+        8, 16, 19, 22, 26, 27, 29, 34, 16, 16, 22, 24, 27, 29, 34, 37, 19, 22, 26, 27, 29, 34, 34, 38, 22, 22, 26, 27, 29, 34, 37, 40,
+        22, 26, 27, 29, 32, 35, 40, 48, 26, 27, 29, 32, 35, 40, 48, 58, 26, 27, 29, 34, 38, 46, 56, 69, 27, 29, 35, 38, 46, 56, 69, 83,
+    ];
+
+    /// The IPU on the game's own MPEG-2 streams, driven with the commands libmpeg issues (VDEC
+    /// MBAI / MBT / motion codes, FDEC for plain fields, BDEC per macroblock):
+    /// 1. sync: every slice must end exactly at the next start code with its row complete (a
+    ///    wrong VLC code, length or sign shifts the stream);
+    /// 2. with T5_MPEG_OUT=<dir>, pictures are reconstructed from the BDEC output with textbook
+    ///    motion compensation (frame prediction, half-pel) and written as PPM (decode order), to
+    ///    tell IPU errors (dequantisation, IDCT, CSC) from errors on the game's side.
+    /// Needs the disc image (T5_DISC or the default path).
+    #[test]
+    fn mpeg_stream_sync() {
+        let iso = std::env::var("T5_DISC").unwrap_or_else(|_| r"E:\Decompilation\Game\Tekken 5 (USA).iso".into());
+        if !std::path::Path::new(&iso).exists() {
+            eprintln!("no disc image, skipped");
+            return;
+        }
+        let out_dir = std::env::var("T5_MPEG_OUT").ok();
+        // T5_MPEG_ES=<file>: the stream a game run fed the IPU (T5_IPUDUMP) instead of the disc's
+        // own streams; it may hold slices cut by the player's BCLR, so desyncs are counted there.
+        let dumped = std::env::var("T5_MPEG_ES").ok();
+        // T5_MPEG_MBLOG=<pic,pic,...>: print every macroblock of these pictures (decode order, 1-based).
+        let mblog: Option<Vec<u32>> = std::env::var("T5_MPEG_MBLOG").ok().map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect());
+        let strict = dumped.is_none();
+        let sources: Vec<u64> = if strict { vec![0xc595000, 0x5fa8800] } else { vec![0] };
+        let mut desyncs = 0;
+        for off in sources {
+            let mut es = match &dumped {
+                Some(p) => std::fs::read(p).unwrap(),
+                None => video_es(&iso, off),
+            };
+            let len = es.len();
+            es.resize(len.div_ceil(16) * 16 + 64, 0);
+            let q: Vec<u128> = es.chunks(16).map(|c| u128::from_le_bytes(c.try_into().unwrap())).collect();
+            let next_start = |from: usize| (from..len.saturating_sub(3)).find(|&i| es[i..i + 3] == [0, 0, 1]);
+            let mut ipu = Ipu::default();
+            let mut qpos: usize;
+            let (mut w, mut h, mut ptype, mut f) = (0usize, 0usize, 0u32, [[1u32; 2]; 2]);
+            let (mut pics, mut slices, mut mbs) = (0, 0, 0);
+            let (mut fwd, mut bwd, mut cur) = (Pic::new(16, 16), Pic::new(16, 16), Pic::new(16, 16));
+            let mut at = 0usize;
+            let raw_out = std::env::var("T5_MPEG_RAW").ok();
+            if let Some(r) = &raw_out {
+                let _ = std::fs::remove_file(r);
+                let _ = std::fs::remove_file(format!("{r}.types"));
+            }
+            let finish = |cur: &Pic, pics: usize, ptype: u32| {
+                if let Some(r) = &raw_out {
+                    // RAW8 macroblocks in raster order (the layout libmpeg feeds the CSC), and
+                    // the picture type per picture (decode order) in <file>.types.
+                    use std::io::Write;
+                    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(r).unwrap();
+                    let (mw, mh) = (cur.w / 16, cur.h / 16);
+                    let mut mbs = Vec::with_capacity(mw * mh * 384);
+                    for my in 0..mh {
+                        for mx in 0..mw {
+                            for y in 0..16 {
+                                mbs.extend_from_slice(&cur.p[0][(my * 16 + y) * cur.w + mx * 16..][..16]);
+                            }
+                            for c in 1..3 {
+                                for y in 0..8 {
+                                    mbs.extend_from_slice(&cur.p[c][(my * 8 + y) * (cur.w / 2) + mx * 8..][..8]);
+                                }
+                            }
+                        }
+                    }
+                    f.write_all(&mbs).unwrap();
+                    let mut t = std::fs::OpenOptions::new().create(true).append(true).open(format!("{r}.types")).unwrap();
+                    let _ = t.write_all(&[b"?IPB"[ptype as usize & 3]]);
+                }
+                if let Some(dir) = &out_dir {
+                    if pics <= 60 || pics % 100 == 0 {
+                        let conv = Ipu::default();
+                        let mut ppm = format!("P6 {} {} 255\n", cur.w, cur.h).into_bytes();
+                        for y in 0..cur.h {
+                            for x in 0..cur.w {
+                                let c = (y / 2) * (cur.w / 2) + x / 2;
+                                let (r, g, b, _) = conv.rgb(cur.p[0][y * cur.w + x] as i32, cur.p[1][c] as i32, cur.p[2][c] as i32);
+                                ppm.extend_from_slice(&[r, g, b]);
+                            }
+                        }
+                        let t = ["?", "I", "P", "B"][ptype as usize];
+                        std::fs::write(format!("{dir}/{off:x}_{pics:03}_{t}.ppm"), ppm).unwrap();
+                    }
+                }
+            };
+            while let Some(sc) = next_start(at) {
+                let code = es[sc + 3];
+                qpos = (sc + 4) / 16;
+                ipu.bp = ((sc + 4) % 16) as u32 * 8;
+                if code <= 0xAF && code != 0 && ptype == 0 {
+                    at = sc + 4;
+                    continue;
+                }
+                if (code == 0x00 || code == 0xB3 || code == 0xB7) && pics > 0 && ptype != 0 {
+                    // The previous picture is complete.
+                    finish(&cur, pics, ptype);
+                    if ptype != 3 {
+                        fwd = std::mem::replace(&mut bwd, cur.clone());
+                    }
+                    ptype = 0;
+                }
+                match code {
+                    0xB3 => {
+                        let (nw, nh) = (read(&mut ipu, &q, &mut qpos, 12) as usize, read(&mut ipu, &q, &mut qpos, 12) as usize);
+                        if !strict && w != 0 {
+                            // Later headers may be cut by the dump (the player's BCLR / SETIQ in
+                            // between); the game's streams keep their size and matrices.
+                            at = sc + 4;
+                            continue;
+                        }
+                        (w, h) = (nw, nh);
+                        read(&mut ipu, &q, &mut qpos, 4 + 4 + 18 + 1 + 10 + 1);
+                        let mut intra = [0u8; 64];
+                        for i in 0..64 {
+                            intra[i] = DEFAULT_INTRA[super::ZIGZAG[i]];
+                        }
+                        if read(&mut ipu, &q, &mut qpos, 1) == 1 {
+                            for v in intra.iter_mut() {
+                                *v = read(&mut ipu, &q, &mut qpos, 8) as u8;
+                            }
+                        }
+                        ipu.iq_intra = intra;
+                        let mut non = [16u8; 64];
+                        if read(&mut ipu, &q, &mut qpos, 1) == 1 {
+                            for v in non.iter_mut() {
+                                *v = read(&mut ipu, &q, &mut qpos, 8) as u8;
+                            }
+                        }
+                        ipu.iq_non = non;
+                        if bwd.w != w {
+                            (fwd, bwd) = (Pic::new(w, h), Pic::new(w, h));
+                        }
+                    }
+                    0x00 => {
+                        read(&mut ipu, &q, &mut qpos, 10);
+                        ptype = read(&mut ipu, &q, &mut qpos, 3);
+                        pics += 1;
+                        cur = Pic::new(w, h);
+                    }
+                    0xB5 => match read(&mut ipu, &q, &mut qpos, 4) {
+                        8 => {
+                            for s in 0..2 {
+                                for t in 0..2 {
+                                    f[s][t] = read(&mut ipu, &q, &mut qpos, 4);
+                                }
+                            }
+                            let idp = read(&mut ipu, &q, &mut qpos, 2);
+                            let ps = read(&mut ipu, &q, &mut qpos, 2);
+                            read(&mut ipu, &q, &mut qpos, 1);
+                            let fpfd = read(&mut ipu, &q, &mut qpos, 1);
+                            let cmv = read(&mut ipu, &q, &mut qpos, 1);
+                            let qst = read(&mut ipu, &q, &mut qpos, 1);
+                            let ivf = read(&mut ipu, &q, &mut qpos, 1);
+                            let alt = read(&mut ipu, &q, &mut qpos, 1);
+                            assert!(ps == 3 && fpfd == 1 && cmv == 0, "field pictures / prediction / concealment not covered");
+                            ipu.ctrl = idp << 16 | alt << 20 | ivf << 21 | qst << 22 | ptype << 24;
+                        }
+                        3 => panic!("quant matrix extension not covered"),
+                        _ => {}
+                    },
+                    0x01..=0xAF => {
+                        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            slices += 1;
+                            let mbw = w.div_ceil(16) as u32;
+                            let mut qsc = read(&mut ipu, &q, &mut qpos, 5);
+                            while read(&mut ipu, &q, &mut qpos, 1) == 1 {
+                                read(&mut ipu, &q, &mut qpos, 8);
+                            }
+                            let mut addr = (code as u32 - 1) * mbw;
+                            let mut first = true;
+                            let mut dcr = true;
+                            // Motion vector predictors [direction][x / y], previous B prediction.
+                            let mut pmv = [[0i32; 2]; 2];
+                            let mut prev_modes = 0u32;
+                            loop {
+                                // macroblock_address_increment (escapes / stuffing first).
+                                let mut inc = 0;
+                                loop {
+                                    let d = run(&mut ipu, &q, &mut qpos, 3 << 28);
+                                    assert!(d != 0, "MBAI error: pic {pics} slice {code} addr {addr} bit {}", qpos * 128 + ipu.bp as usize);
+                                    match d & 0xFFFF {
+                                        0x23 => inc += 33,
+                                        0x22 => {}
+                                        v => {
+                                            inc += v;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if first {
+                                    addr += inc - 1;
+                                    first = false;
+                                } else {
+                                    // Skipped macroblocks: P forward with vector 0, B as the last.
+                                    for s in 1..inc {
+                                        let a = addr + s;
+                                        if ptype == 2 {
+                                            pmv = [[0; 2]; 2];
+                                        }
+                                        // P pictures predict from the newest reference.
+                                        let f0 = if ptype == 2 { &bwd } else { &fwd };
+                                        predict(&mut cur, f0, &bwd, a, mbw, if ptype == 2 { 8 } else { prev_modes }, &pmv, None);
+                                    }
+                                    addr += inc;
+                                    if inc > 1 {
+                                        dcr = true;
+                                    }
+                                }
+                                let modes = run(&mut ipu, &q, &mut qpos, 3 << 28 | 1 << 26) & 0x1F;
+                            if let Some(want) = &mblog {
+                                if want.contains(&(pics as u32)) {
+                                    eprintln!("MB pic {pics} type {ptype} addr {addr} (x {} y {}) inc {inc} modes {modes:02x} pmv {pmv:?}", addr % mbw, addr / mbw);
+                                }
+                            }
+                                assert!(modes != 0, "MBT error: pic {pics} type {ptype} slice {code} addr {addr}");
+                                if modes & 16 != 0 {
+                                    qsc = read(&mut ipu, &q, &mut qpos, 5);
+                                }
+                                for (s, bit) in [(0usize, 8u32), (1, 4)] {
+                                    if modes & bit != 0 {
+                                        for t in 0..2 {
+                                            let mc = run(&mut ipu, &q, &mut qpos, 3 << 28 | 2 << 26) as i32 as i16 as i32;
+                                            let r = f[s][t] as i32 - 1;
+                                            let delta = if r == 0 || mc == 0 {
+                                                mc
+                                            } else {
+                                                let res = read(&mut ipu, &q, &mut qpos, r as u32) as i32;
+                                                let d = ((mc.abs() - 1) << r) + res + 1;
+                                                if mc < 0 { -d } else { d }
+                                            };
+                                            let range = 32 << r;
+                                            let mut v = pmv[s][t] + delta;
+                                            if v < -(16 << r) {
+                                                v += range;
+                                            } else if v > (16 << r) - 1 {
+                                                v -= range;
+                                            }
+                                            pmv[s][t] = v;
+                                        }
+                                    }
+                                }
+                                let intra = modes & 1 != 0;
+                                if mblog.as_ref().is_some_and(|w| w.is_empty() || w.contains(&(pics as u32))) {
+                                    eprintln!("MV {pics} {ptype} {addr} {modes} {} {} {} {}", pmv[0][0], pmv[0][1], pmv[1][0], pmv[1][1]);
+                                }
+                                if intra || (ptype == 2 && modes & 8 == 0) {
+                                    pmv = [[0; 2]; 2];
+                                }
+                                let mut resid: Option<Vec<i16>> = None;
+                                if intra || modes & 2 != 0 {
+                                    let cmd = 2 << 28 | (intra as u32) << 27 | ((intra && dcr) as u32) << 26 | qsc << 16;
+                                    run(&mut ipu, &q, &mut qpos, cmd);
+                                    let v: Vec<i16> = ipu.out.drain(..48).flat_map(|x| (0..8).map(move |k| (x >> (16 * k)) as u16 as i16)).collect();
+                                if mblog.as_ref().is_some_and(|w| w.contains(&(pics as u32))) {
+                                    eprintln!("BDEC pic {pics} addr {addr} cbp {:02x} Y {:?}", (ipu.ctrl >> 8) & 0x3F, &v[..256]);
+                                }
+                                    resid = Some(v);
+                                }
+                                let f0 = if ptype == 2 { &bwd } else { &fwd };
+                                if intra {
+                                    predict(&mut cur, f0, &bwd, addr, mbw, 0, &pmv, resid.as_deref());
+                                } else {
+                                    let m = if ptype == 2 { modes | 8 } else { modes };
+                                    predict(&mut cur, f0, &bwd, addr, mbw, m, &pmv, resid.as_deref());
+                                    prev_modes = m & 12;
+                                }
+                                dcr = !intra;
+                                mbs += 1;
+                                // Slice end: only zero bits up to the next start code.
+                                let bp = qpos * 128 + ipu.bp as usize;
+                                let next = next_start(bp.div_ceil(8)).unwrap_or(len);
+                                if (bp..next * 8).all(|b| es[b / 8] >> (7 - b % 8) & 1 == 0) {
+                                    assert_eq!(addr % mbw, mbw - 1, "slice ended early: pic {pics} type {ptype} slice {code} addr {addr}");
+                                    break;
+                                }
+                                assert!(addr % mbw < mbw - 1, "slice ran past its row: pic {pics} type {ptype} slice {code} addr {addr} bit {bp}");
+                            }
+                        }));
+                        if let Err(e) = r {
+                            if strict {
+                                std::panic::resume_unwind(e);
+                            }
+                            desyncs += 1;
+                        }
+                    }
+                    0xB7 => break,
+                    _ => {}
+                }
+                at = sc + 4;
+            }
+            // A BCLR line between streams (and the trace flushed), as the game's player issues.
+            super::trace(0, 0, &[], "");
+            eprintln!("stream {off:#x}: {pics} pictures, {slices} slices, {mbs} macroblocks, {desyncs} slices out of sync");
+            assert!(pics > 0 && slices > 0);
+        }
+        assert!(!strict || desyncs == 0);
+    }
+
+    /// Macroblock `addr`: prediction (modes: 8 forward, 4 backward; 0 none = intra) plus the
+    /// BDEC output (intra: the pixels, else the residual).
+    #[allow(clippy::too_many_arguments)]
+    fn predict(cur: &mut Pic, fwd: &Pic, bwd: &Pic, addr: u32, mbw: u32, modes: u32, pmv: &[[i32; 2]; 2], blk: Option<&[i16]>) {
+        let (mx, my) = ((addr % mbw) as i32 * 16, (addr / mbw) as i32 * 16);
+        for c in 0..3 {
+            let (bs, x, y, pw) = if c == 0 { (16, mx, my, cur.w) } else { (8, mx / 2, my / 2, cur.w / 2) };
+            let mv = |d: usize| if c == 0 { (pmv[d][0], pmv[d][1]) } else { (pmv[d][0] / 2, pmv[d][1] / 2) };
+            let pf = (modes & 8 != 0).then(|| { let (a, b) = mv(0); fwd.pred(c, x, y, a, b, bs, bs) });
+            let pb = (modes & 4 != 0).then(|| { let (a, b) = mv(1); bwd.pred(c, x, y, a, b, bs, bs) });
+            let base = if c == 0 { 0 } else { 256 + (c - 1) * 64 };
+            for j in 0..bs {
+                for i in 0..bs {
+                    let p = match (&pf, &pb) {
+                        (Some(a), Some(b)) => (a[j * bs + i] + b[j * bs + i] + 1) >> 1,
+                        (Some(a), None) => a[j * bs + i],
+                        (None, Some(b)) => b[j * bs + i],
+                        (None, None) => 0,
+                    };
+                    let r = blk.map_or(0, |v| v[base + j * bs + i] as i32);
+                    cur.p[c][(y as usize + j) * pw + x as usize + i] = (p + r).clamp(0, 255) as u8;
+                }
+            }
+        }
+    }
+
+    /// The integer IDCT stays within 1 of the exact transform (IEEE 1180 range inputs).
+    #[test]
+    fn idct_matches_reference() {
+        let mut seed = 12345u32;
+        let mut rnd = |m: i32| {
+            seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+            ((seed >> 8) % (2 * m as u32 + 1)) as i32 - m
+        };
+        for _ in 0..2000 {
+            let mut blk = [0i32; 64];
+            for (k, v) in blk.iter_mut().enumerate() {
+                *v = if k < 10 { rnd(256) } else { rnd(5) };
+            }
+            let got = super::idct(&blk);
+            for y in 0..8 {
+                for x in 0..8 {
+                    let mut s = 0.0f64;
+                    for v in 0..8 {
+                        for u in 0..8 {
+                            let cu = if u == 0 { 0.5f64.sqrt() } else { 1.0 };
+                            let cv = if v == 0 { 0.5f64.sqrt() } else { 1.0 };
+                            let pi = std::f64::consts::PI;
+                            s += cu * cv / 4.0 * blk[v * 8 + u] as f64 * ((2 * x + 1) as f64 * u as f64 * pi / 16.0).cos() * ((2 * y + 1) as f64 * v as f64 * pi / 16.0).cos();
+                        }
+                    }
+                    assert!((got[y * 8 + x] - s.round() as i32).abs() <= 1, "{blk:?}");
+                }
+            }
+        }
     }
 }

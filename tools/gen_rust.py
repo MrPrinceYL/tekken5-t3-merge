@@ -48,6 +48,7 @@ SHEETS, RUST = ROOT / "sheets", ROOT / "rust"
 CRATES = RUST / "crates"
 PREFIX = "t5"
 PART_INSTR = int(os.environ.get("T5_PART_INSTR", "30000"))
+IDENT_MAX = 0x1000  # program image bytes kept for identification
 
 VN = re.compile(r"([CRUMX])([0-9a-f]+):(\d+)")
 BIN = {
@@ -213,6 +214,7 @@ class Gen:
         self.words = (0, 0)             # (own word, delay-slot word or own word)
         self.extern = set()
         self.uwide = set()              # unique temporaries that hold 16-byte values
+        self.usub = {}                  # unique offset inside a wider unique -> (base, byte)
 
     # ---- values ----
     def rd(self, v, want_wide=False):
@@ -230,7 +232,11 @@ class Gen:
                 o = reg_off(off)
                 e = f"c.r128(0x{o:x})" if wide else f"c.r(0x{o:x},{s})"
         elif k == "U":
-            if off in self.uwide and not wide:
+            if off in self.usub:
+                # Bytes of a wider temporary (multu's HI is `Uaf04:4` of the product `Uaf00:8`).
+                b, i = self.usub[off]
+                e = f"mask((u{b:x}>>{8 * i}) as u64,{s})"
+            elif off in self.uwide and not wide:
                 e = f"(u{off:x} as u64)"
             else:
                 e = f"u{off:x}"
@@ -261,6 +267,8 @@ class Gen:
             o = reg_off(off)
             return f"c.wr128(0x{o:x},{expr});" if dst_wide else f"c.wr(0x{o:x},{s},{expr});"
         if k == "U":
+            if off in self.usub:
+                raise ValueError(f"write to part of a temporary U{off:x}")
             if off in self.uwide and not dst_wide:
                 return f"u{off:x}=({expr}) as u128;"
             return f"u{off:x}={expr};"
@@ -389,12 +397,21 @@ class Gen:
             if m.group(1) == "U":
                 uses[int(m.group(2), 16)].add(int(m.group(3)))
         self.uwide = {u for u, ss in uses.items() if max(ss) > 8}
+        self.usub = {u: (b, u - b) for u in uses for b, ss in uses.items() if b < u < b + max(ss)}
         relative = [False]
         try:
             body = [self.op(o, i, own, relative) for i, o in enumerate(ops)]
         except Exception as e:
             raise ValueError(f"{self.variant} {self.cur:#010x} {self.asm}: {e}") from e
-        decl = "".join(f"let mut u{u:x}:{'u128' if u in self.uwide else 'u64'}=0;" for u in sorted(uses))
+        if self.asm.split()[0].lstrip("_") in ("lq", "sq"):
+            # The R5900 ignores the low four address bits of LQ / SQ; Ghidra's p-code loads /
+            # stores the four words from the unmasked address (libmpeg's motion compensation
+            # loads unaligned reference rows with LQ and aligns them with QFSRV).
+            mnem, _, out, _ = parse_op(ops[0])
+            if mnem != "INT_ADD" or out is None or out[0] != "U":
+                raise ValueError(f"{self.variant} {self.cur:#010x} {self.asm}: unexpected address op {ops[0]}")
+            body[0] += f"u{out[1]:x}&=!0xF;"
+        decl = "".join(f"let mut u{u:x}:{'u128' if u in self.uwide else 'u64'}=0;" for u in sorted(uses) if u not in self.usub)
         if relative[0]:
             arms = "".join(f"{i}=>{{{b}i={i + 1};}}" for i, b in enumerate(body))
             return f"{{{decl}let mut i:i64=0;loop{{match i{{{arms}_=>break}}}}}}"
@@ -572,17 +589,34 @@ def gen_variant(v, funcs, hle_rows):
         crates.append(crate)
         dirs.append(f"crates/recomp/{name}/part_{n:02}")
         print(f"  {crate}: {len(part)} functions, {sum(len(by_func[e]) for e in part)} instructions", flush=True)
-    # Identification: the program image bytes at its entry point (the runtime matches RAM).
+    # The program image from its entry point on (identification, see `idents`).
     entry = int(v["entry"], 16)
-    ident = b""
+    image = b""
     for r in memory_rows:
         a = int(r["addr"], 16)
         raw = bytes.fromhex(r["hex"])
-        if a <= entry < a + len(raw) or (ident and len(ident) < 64):
-            ident += raw[max(0, entry - a):] if not ident else raw
-        if len(ident) >= 64:
+        if a <= entry < a + len(raw) or image:
+            image += raw[max(0, entry - a):] if not image else raw
+        if len(image) >= IDENT_MAX:
             break
-    return crates, dirs, names, entries, ident[:64], by_func
+    return crates, dirs, names, entries, image[:IDENT_MAX], by_func
+
+
+def idents(progs):
+    """Per program, the image bytes the runtime matches in RAM at its entry point: at least 64,
+    and as many as it takes to differ from every other program's image at that address
+    (tekken1 and tekken2 share entry point and crt0)."""
+    out = []
+    for v, _, _, img in progs:
+        e = int(v["entry"], 16)
+        others = [w_img[e - int(w["entry"], 16):] for w, _, _, w_img in progs
+                  if w is not v and 0 <= e - int(w["entry"], 16) < len(w_img)]
+        n = 64
+        while any(o[:n] == img[:n] for o in others if len(o) >= n):
+            n += 4
+            assert n <= len(img), f"{v['variant']}: no unique identification within {IDENT_MAX} bytes"
+        out.append(img[:n])
+    return out
 
 
 def main():
@@ -602,6 +636,7 @@ def main():
         all_crates += crates
         all_dirs += dirs
         progs.append((v, crates, names, ident))
+    progs = [(v, c, n, i) for (v, c, n, _), i in zip(progs, idents(progs))]
 
     import gen_iop
     iop_crates, iop_dirs = gen_iop.generate(CRATES, PART_OPT)

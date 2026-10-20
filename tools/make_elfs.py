@@ -32,7 +32,12 @@ VARIANTS = [
     ('starblade', 3, 'StarBlade'),
     ('devil', 4, 'Devil Within'),
     ('loader', 'TK5DATA4.BIN', 'Program loader (TK5DATA4.BIN)'),
+    ('lzstub', 'lzstub', 'Loader unpack routine (decrypted to 0x01E73800)'),
 ]
+
+# The loader (TK5DATA4 0x01E00658) XORs 46 words at 0x01E1C740 with 0xFF0FFF0F, copies them to
+# 0x01E73800 (past its bss) and calls them: the routine that unpacks the program it starts.
+STUB_SRC, STUB_WORDS, STUB_KEY, STUB_ADDR = 0x01E1C740, 46, 0xFF0FFF0F, 0x01E73800
 
 MAIN_TEXT = 0x001F0180   # TK5DATA3 entry 5 (SLUS 0x00D060D0: decompress to 0x1F0180)
 MAIN_DMH = 0x00488000    # TK5DATA3 entry 6 (SLUS 0x00D060D0: decompress to 0x488000)
@@ -127,6 +132,21 @@ def main_sections(ex):
     return entry, flags, secs
 
 
+def lzstub_sections(ex):
+    """The routine the loader decrypts and runs at 0x01E73800 (gp and flags of the loader)."""
+    with open(os.path.join(ex, 'files', 'TK5DATA4.BIN'), 'rb') as f:
+        _, flags, secs = read_elf(f.read())
+    src = next(s for s in secs if s['type'] != SHT_NOBITS and s['flags'] & SHF_ALLOC
+               and s['addr'] <= STUB_SRC < s['addr'] + s['size'])
+    o = STUB_SRC - src['addr']
+    words = struct.unpack_from(f'<{STUB_WORDS}I', src['data'], o)
+    text = b''.join(struct.pack('<I', x ^ STUB_KEY) for x in words)
+    reg = next(s for s in secs if s['type'] == SHT_MIPS_REGINFO)
+    out = [dict(name='.text', type=SHT_PROGBITS, flags=SHF_ALLOC | SHF_EXEC, addr=STUB_ADDR, size=len(text), data=text),
+           dict(reg)]
+    return STUB_ADDR, flags, out
+
+
 def main():
     """Write the ELFs and variants.csv for the extracted folder given on the command line."""
     ex = sys.argv[1]
@@ -135,7 +155,10 @@ def main():
         w = csv.writer(fo)
         w.writerow(['variant', 'source', 'title', 'entry', 'gp', 'start', 'end', 'elf', 'sha1'])
         for name, src, title in VARIANTS:
-            if src == 'main':
+            if src == 'lzstub':
+                entry, flags, secs = lzstub_sections(ex)
+                source = 'TK5DATA4.BIN@0x01E1C740^0xFF0FFF0F'
+            elif src == 'main':
                 entry, flags, secs = main_sections(ex)
                 source = 'SLUS_210.59+TK5DATA3:5@0x001F0180+TK5DATA3:6@0x00488000'
             elif isinstance(src, str):

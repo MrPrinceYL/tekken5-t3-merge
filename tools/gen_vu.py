@@ -3,6 +3,10 @@
 The game uploads its VU1 / VU0 micro programs at run time (VIF MPG). `t5-headless` with
 T5_VUDUMP=1 writes every distinct micro memory image it runs to run/vu_dumps/. This tool
 
+  --collect-elf VARIANT  the same statically from the program's .vutext section (all of
+                  its VU1 micro code, blocks and entry shapes; see collect_elf);
+  --collect-image-shapes PATH...  entry shapes of the sheet's blocks followed statically
+                  through dumped micro memory images (micro code from data files);
   --collect DIR   merges the instruction pairs of those images into sheets/vu_microcode.csv
                   (vu, upper, lower, disassembly), the source of truth for the translation;
   (default)       generates crates/t5-vu from the sheet: every pair becomes a specialised Rust
@@ -20,14 +24,18 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 SHEET = ROOT / "sheets" / "vu_microcode.csv"
 BLOCKS = ROOT / "sheets" / "vu_blocks.csv"
-BCOLS = ["vu", "pc", "len", "key", "pairs", "mac_live"]
+BCOLS = ["vu", "pc", "len", "key", "pairs", "mac_live", "shapes"]
 CRATE = ROOT / "rust" / "crates" / "t5-vu"
-# Crates the translated blocks are spread over (built in parallel).
-PARTS = 16
+# Crates the translated blocks are spread over (built in parallel). Each crate needs about
+# 12 MB of compiler memory per block at opt-level 3: 16 crates of ~250 blocks (3 GB each,
+# 16 at once on 16 cores) ran 32 GB PCs out of memory (17.10.). Keep blocks / PARTS <= ~100
+# (more blocks in the sheet -> raise PARTS, then run gen_rust.py: it lists the crates).
+PARTS = 48
 COLS = ["vu", "upper", "lower", "disasm"]
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import vudis  # noqa: E402
+import vuc  # noqa: E402
 
 
 def read_sheet():
@@ -123,10 +131,34 @@ def mac_live(code, pc):
 
 
 def read_blocks():
+    """Rows by key. The key is recomputed from the content (as ps2_runtime::vu::block_key: VU
+    number + words, not the address): the same block loaded at another pc is one row, its entry
+    shapes merged; `pc` is where it was first seen."""
     if not BLOCKS.exists():
         return {}
+    rows = {}
     with open(BLOCKS, newline="") as f:
-        return {r["key"]: r for r in csv.DictReader(f)}
+        for r in csv.DictReader(f):
+            r["key"] = f"{block_key(int(r['vu']), r['pairs']):016x}"
+            old = rows.get(r["key"])
+            if old is None:
+                rows[r["key"]] = r
+                continue
+            have = [x for x in (old.get("shapes") or "").split("|") if x]
+            for sh in (r.get("shapes") or "").split("|"):
+                if sh and sh not in have:
+                    have.append(sh)
+            old["shapes"] = "|".join(have)
+    return rows
+
+
+def block_key(vu, pairs):
+    """Key of a block from its sheet text ("upper.lower ...")."""
+    words = []
+    for pr in pairs.split():
+        up, lo = (int(x, 16) for x in pr.split("."))
+        words += [lo, up]
+    return fnv([vu] + words)
 
 
 def collect_blocks(dump_dir):
@@ -150,18 +182,48 @@ def collect_blocks(dump_dir):
             if n is None:
                 continue
             words = list(struct.unpack_from(f"<{2 * n}I", code, pc * 8))
-            key = f"{fnv([pc] + words):016x}"
+            key = f"{fnv([int(img[2])] + words):016x}"
             if key in rows:
                 continue
             pairs = " ".join(f"{words[2 * i + 1]:08x}.{words[2 * i]:08x}" for i in range(n))
             live = "".join("1" if mac_live(code, pc + i) else "0" for i in range(n))
-            rows[key] = {"vu": img[2], "pc": f"{pc:x}", "len": n, "key": key, "pairs": pairs, "mac_live": live}
+            rows[key] = {"vu": img[2], "pc": f"{pc:x}", "len": n, "key": key, "pairs": pairs, "mac_live": live, "shapes": ""}
     with open(BLOCKS, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=BCOLS)
         w.writeheader()
         for k in sorted(rows):
             w.writerow(rows[k])
     print(f"{len(rows)} blocks in {BLOCKS.name} ({len(rows) - before} new)")
+
+
+def collect_shapes(path):
+    """Entry shapes seen per block (vu-bench VUBENCH_SHAPES / the runtime: lines
+    "block-key shape-key shape") -> sheets/vu_blocks.csv column `shapes` ("|"-separated)."""
+    rows = read_blocks()
+    added = 0
+    for line in Path(path).read_text().splitlines():
+        parts = line.split(" ", 2)
+        if len(parts) < 2:
+            continue
+        bkey, skey = parts[0], parts[1]
+        shape = parts[2] if len(parts) > 2 else ""
+        if bkey not in rows:
+            continue
+        if f"{vuc.shape_key(shape):016x}" != skey:
+            raise SystemExit(f"shape key mismatch for {shape!r}: {skey}")
+        # An empty shape (nothing in flight) is written "-".
+        have = [x for x in (rows[bkey].get("shapes") or "").split("|") if x]
+        mark = shape if shape else "-"
+        if mark not in have:
+            have.append(mark)
+            rows[bkey]["shapes"] = "|".join(have)
+            added += 1
+    with open(BLOCKS, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=BCOLS)
+        w.writeheader()
+        for k in sorted(rows):
+            w.writerow({c: rows[k].get(c, "") for c in BCOLS})
+    print(f"{added} entry shapes added to {BLOCKS.name}")
 
 
 def collect(dump_dir):
@@ -185,10 +247,180 @@ def collect(dump_dir):
     collect_blocks(dump_dir)
 
 
+def write_blocks(rows):
+    with open(BLOCKS, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=BCOLS)
+        w.writeheader()
+        for k in sorted(rows):
+            w.writerow({c: rows[k].get(c, "") for c in BCOLS})
+
+
+def collect_elf(variant):
+    """VU1 micro code straight from a program's `.vutext` section (no run needed): every pair
+    into sheets/vu_microcode.csv, every block (linear sweep + static branch targets) into
+    sheets/vu_blocks.csv, and entry shapes followed statically (static_shapes)."""
+    sec = next(r for r in csv.DictReader(open(ROOT / "sheets" / "sections.csv", newline=""))
+               if r["variant"] == variant and r["name"] == ".vutext")
+    start, end = int(sec["start"], 16), int(sec["end"], 16) + 1
+    elf = (ROOT.parent / "Tekken5" / "extracted" / "elf" / f"{variant}.elf").read_bytes()
+    phoff, = struct.unpack_from("<I", elf, 0x1C)
+    phnum, = struct.unpack_from("<H", elf, 0x2C)
+    code = None
+    for i in range(phnum):
+        _, off, va, _, fsz, _ = struct.unpack_from("<6I", elf, phoff + i * 32)
+        if va <= start and end <= va + fsz:
+            code = elf[off + start - va:off + end - va]
+    code = code[:len(code) // 8 * 8]
+    n = len(code) // 8
+    # Pairs.
+    rows = read_sheet()
+    before = len(rows)
+    for pc in range(n):
+        lo, up = struct.unpack_from("<II", code, pc * 8)
+        key = ("1", f"{up:08x}", f"{lo:08x}")
+        if key not in rows:
+            rows[key] = {"vu": "1", "upper": key[1], "lower": key[2], "disasm": vudis.pair(code, pc)[5:].strip()}
+    with open(SHEET, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=COLS)
+        w.writeheader()
+        for k in sorted(rows):
+            w.writerow(rows[k])
+    print(f"{variant} .vutext: {n} pairs, {len(rows) - before} new in {SHEET.name}")
+    brows = read_blocks()
+    bbefore = len(brows)
+    nblocks, added = static_shapes(code, 1, brows, add_blocks=True, wrap=False)
+    write_blocks(brows)
+    print(f"{nblocks} blocks in .vutext, {len(brows) - bbefore} new in {BLOCKS.name}, {added} entry shapes added")
+
+
+def static_shapes(code, vu, brows, add_blocks, wrap=True, known=()):
+    """Blocks of a micro code image (linear sweep + static branch targets) and their entry
+    shapes, followed statically into `brows` (sheets/vu_blocks.csv rows; new blocks only with
+    `add_blocks`). Entered with an empty pipeline ("-"): the image start, after every E-bit
+    block, every block no static edge reaches (a program start the EE / VIF calls, a JR / JALR
+    target) and the return site of every BAL / JALR; each translated block hands its exit shape
+    to its fall-through and static branch successors, at most MAX_SHAPES per block. Blocks are
+    keyed by content, so where the game loads them does not matter. Returns (blocks, shapes
+    added). `wrap`: branch targets wrap around (a whole micro memory image, not a section).
+    `known`: (pc, bytes) of blocks the runtime started (sheet rows): where the image holds them
+    at that pc they are block starts too (MSCAL entries no sweep finds)."""
+    n = len(code) // 8
+
+    def target(pc, ln, lo):
+        t = pc + ln - 1 + (((lo & 0x7FF) ^ 0x400) - 0x400)
+        return t % n if wrap else t
+
+    blocks = {}
+    entry = {0}
+    work = [0] + [pc for pc, b in known if code[pc * 8:pc * 8 + len(b)] == b]
+    while work:
+        pc = work.pop()
+        if pc in blocks or not 0 <= pc < n:
+            continue
+        ln = block_len(code, pc)
+        if ln is None:
+            continue
+        blocks[pc] = ln
+        lo, up = pair_at(code, pc + ln - 2)
+        work.append(pc + ln)
+        if up & 0x40000000:
+            entry.add(pc + ln)
+        if is_branch(lo, up) and (lo >> 25) not in (0x24, 0x25):
+            work.append(target(pc, ln, lo))
+
+    def successors(pc, ln):
+        lo, up = pair_at(code, pc + ln - 2)
+        if up & 0x40000000:
+            return []
+        out = []
+        if not (is_branch(lo, up) and (lo >> 25) in (0x20, 0x21, 0x24, 0x25)):
+            out.append(pc + ln)
+        if is_branch(lo, up) and (lo >> 25) not in (0x24, 0x25):
+            out.append(target(pc, ln, lo))
+        return out
+
+    reached = set()
+    for pc, ln in blocks.items():
+        reached.update(successors(pc, ln))
+        lo, up = pair_at(code, pc + ln - 2)
+        if is_branch(lo, up) and (lo >> 25) in (0x21, 0x25):
+            entry.add(pc + ln)
+    entry.update(pc for pc in blocks if pc not in reached)
+    info = {}
+    for pc, ln in blocks.items():
+        words = list(struct.unpack_from(f"<{2 * ln}I", code, pc * 8))
+        key = f"{fnv([vu] + words):016x}"
+        if key not in brows:
+            if not add_blocks:
+                continue
+            prs = [(words[2 * i + 1], words[2 * i]) for i in range(ln)]
+            live = "".join("1" if mac_live(code, pc + i) else "0" for i in range(ln))
+            brows[key] = {"vu": str(vu), "pc": f"{pc:x}", "len": ln, "key": key,
+                          "pairs": " ".join(f"{u:08x}.{l:08x}" for u, l in prs), "mac_live": live, "shapes": ""}
+        r = brows[key]
+        prs = [tuple(int(x, 16) for x in pr.split(".")) for pr in r["pairs"].split()]
+        info[pc] = (key, prs, r["mac_live"])
+    # Entry shapes, followed to a fixed point: first the shapes already known for these
+    # blocks and the static entries, so they take the MAX_SHAPES slots first.
+    MAX_SHAPES = 4
+    seen = set()
+    added = 0
+
+    def follow(work):
+        nonlocal added
+        while work:
+            pc, sh = work.pop()
+            if (pc, sh) in seen or pc not in info:
+                continue
+            key, prs, live = info[pc]
+            have = [x for x in (brows[key].get("shapes") or "").split("|") if x]
+            mark = sh if sh else "-"
+            if mark not in have:
+                if len(have) >= MAX_SHAPES:
+                    continue
+                have.append(mark)
+                brows[key]["shapes"] = "|".join(have)
+                added += 1
+            seen.add((pc, sh))
+            out = vuc.exit_shape(pc, prs, live, sh)
+            if out is None:
+                continue
+            work += [(t, out) for t in successors(pc, len(prs))]
+
+    work = [(pc, "") for pc in entry if pc in info]
+    for pc, (key, _, _) in info.items():
+        work += [(pc, "" if sh == "-" else sh) for sh in (brows[key].get("shapes") or "").split("|") if sh]
+    follow(work)
+    return len(blocks), added
+
+
+def collect_image_shapes(paths):
+    """Entry shapes of the sheet's blocks, followed statically (static_shapes) through micro
+    memory images: T5_VUDUMP dumps (vu1_<hash>.bin, files or directories; VU0 runs pair by pair
+    anyway). For micro code the
+    game loads from its data files, which no .vutext holds."""
+    brows = read_blocks()
+    files = []
+    for p in map(Path, paths):
+        files += sorted(p.rglob("vu1_*.bin")) if p.is_dir() else [p]
+    added = 0
+    known = []
+    for r in brows.values():
+        if r["vu"] == "1":
+            words = [w for pr in r["pairs"].split() for w in reversed([int(x, 16) for x in pr.split(".")])]
+            known.append((int(r["pc"], 16), struct.pack(f"<{len(words)}I", *words)))
+    for f in files:
+        added += static_shapes(f.read_bytes(), int(f.name[2]), brows, add_blocks=False, known=known)[1]
+    write_blocks(brows)
+    print(f"{len(files)} images, {added} entry shapes added to {BLOCKS.name}")
+
+
 def write_if_changed(path, text):
     path.parent.mkdir(parents=True, exist_ok=True)
-    if not path.exists() or path.read_text() != text:
-        path.write_text(text)
+    # CRLF on every platform (as written on Windows), so Linux and Windows output is identical.
+    data = text.replace("\n", "\r\n").encode()
+    if not path.exists() or path.read_bytes() != data:
+        path.write_bytes(data)
 
 
 def generate():
@@ -216,28 +448,63 @@ def generate():
     for name, part in zip(names, parts):
         po = ["//! GENERATED by tools/gen_vu.py from sheets/vu_blocks.csv. Do not edit.",
               "//! Translated VU micro code blocks (see ps2_runtime::vu::pair_lean).",
-              "use ps2_runtime::vu::{blk_at, blk_enter, blk_one, blk_pc, pair_lean, PairFn, Run};", ""]
+              "#![allow(unused, non_snake_case, clippy::all)]",
+              "use ps2_runtime::vu::{blk_enter, blk_one, blk_parts, pair_lean, Ctl, PairFn, Pipe, Run, VuRegs};",
+              "use ps2_runtime::vuc;",
+              "use ps2_runtime::Machine;", ""]
         for b in part:
             pc = int(b["pc"], 16)
+            vu = int(b["vu"])
             prs = [tuple(int(x, 16) for x in pr.split(".")) for pr in b["pairs"].split()]  # (up, lo)
             n = len(prs)
             wr = [backup_writer(lo, up) for (up, lo) in prs]
+            key = b["key"]
+            # Entry: the run must be at the block start with no branch pending; then the kernel,
+            # whose reference parameters do not alias (registers stay in host registers).
             po.append("#[inline(never)]")
-            po.append(f"fn b_{b['key']}(r: &mut Run) -> bool {{")
-            po.append(f"    if !blk_enter(r, 0x{pc:x}, {n}) {{ return blk_one(r); }}")
+            po.append(f"fn b_{key}(r: &mut Run) -> bool {{")
+            po.append(f"    if !blk_enter(r, {n}) {{ return blk_one(r); }}")
+            po.append("    let (regs, data, p, c, mp) = blk_parts(r);")
+            po.append("    let pc0 = c.pc;")
+            # Statically translated variants per entry shape (tools/vuc.py), else pair by pair.
+            variants = []
+            if vu == 1 and b.get("shapes"):
+                for sh in b["shapes"].split("|"):
+                    sh = "" if sh == "-" else sh
+                    src = vuc.compile_block(f"s_{key}_{len(variants)}", pc, prs, b["mac_live"], sh)
+                    if src is not None:
+                        variants.append((vuc.shape_key(sh), src))
+            if variants:
+                po.append("    let key = if p.key_ok { p.key } else { p.canon(regs); p.shape_key() };")
+                po.append("    match key {")
+                for j, (sk, _) in enumerate(variants):
+                    po.append(f"        0x{sk:016x} => s_{key}_{j}(regs, data, p, c, mp),")
+                po.append(f"        _ => {{ p.key_ok = false; k_{key}(pc0, regs, data, p, c, mp) }}")
+                po.append("    }")
+            else:
+                po.append("    p.key_ok = false;")
+                po.append(f"    k_{key}(pc0, regs, data, p, c, mp)")
+            po.append("}")
+            for _, src in variants:
+                po.append(src)
+            po.append("#[inline(never)]")
+            po.append(f"fn k_{key}(pc0: u32, regs: &mut VuRegs, data: *mut u8, p: &mut Pipe, c: &mut Ctl, mp: *mut Machine) -> bool {{")
+            icount = 0x800 if vu == 1 else 0x200
             for i, ((up, lo), live) in enumerate(zip(prs, b["mac_live"])):
                 ctrl = i >= n - 2
                 vib = i < 2 or wr[i] or (i >= 1 and wr[i - 1]) or (i >= 2 and wr[i - 2]) or is_branch(lo, up)
                 args = (f"0x{lo:08x}, 0x{up:08x}, {'true' if live == '1' else 'false'}, "
-                        f"{'true' if ctrl else 'false'}, {'true' if vib else 'false'}, 0x{pc + i:x}")
+                        f"{'true' if ctrl else 'false'}, {'true' if vib else 'false'}, {vu}")
+                at = f"(pc0 + {i}) % {icount}"
+                call = f"pair_lean::<{args}>({at}, regs, data, p, c, mp)"
                 if not ctrl:
-                    po.append(f"    pair_lean::<{args}>(r);")
+                    po.append(f"    {call};")
                 else:
                     if i == n - 2:
-                        po.append(f"    blk_pc(r, 0x{pc + i:x});")
+                        po.append(f"    c.pc = {at};")
                     else:
-                        po.append(f"    if blk_at(r) != 0x{pc + i:x} {{ return false; }}")
-                    po.append(f"    if pair_lean::<{args}>(r) {{ return true; }}")
+                        po.append(f"    if c.pc != {at} {{ return false; }}")
+                    po.append(f"    if {call} {{ return true; }}")
             po.append("    false")
             po.append("}")
         po.append(f"pub static BLOCKS: [(u64, PairFn); {len(part)}] = [")
@@ -265,5 +532,11 @@ def generate():
 if __name__ == "__main__":
     if len(sys.argv) > 2 and sys.argv[1] == "--collect":
         collect(sys.argv[2])
+    elif len(sys.argv) > 2 and sys.argv[1] == "--collect-elf":
+        collect_elf(sys.argv[2])
+    elif len(sys.argv) > 2 and sys.argv[1] == "--collect-image-shapes":
+        collect_image_shapes(sys.argv[2:])
+    elif len(sys.argv) > 2 and sys.argv[1] == "--collect-shapes":
+        collect_shapes(sys.argv[2])
     else:
         generate()

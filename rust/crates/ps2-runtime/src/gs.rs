@@ -47,7 +47,7 @@ pub const COLUMN32: [[u32; 8]; 8] = [
     [48, 49, 52, 53, 56, 57, 60, 61],
     [50, 51, 54, 55, 58, 59, 62, 63],
 ];
-const BLOCK16: [[u32; 4]; 8] = [
+pub const BLOCK16: [[u32; 4]; 8] = [
     [0, 2, 8, 10],
     [1, 3, 9, 11],
     [4, 6, 12, 14],
@@ -57,7 +57,7 @@ const BLOCK16: [[u32; 4]; 8] = [
     [20, 22, 28, 30],
     [21, 23, 29, 31],
 ];
-const BLOCK16S: [[u32; 4]; 8] = [
+pub const BLOCK16S: [[u32; 4]; 8] = [
     [0, 2, 16, 18],
     [1, 3, 17, 19],
     [8, 10, 24, 26],
@@ -159,6 +159,45 @@ pub fn addr4(bp: u32, bw: u32, x: u32, y: u32) -> usize {
     ((bp << 9) + (page << 14) + (block << 9) + nib) as usize & (2 * VRAM - 1)
 }
 
+/// A CLUT as a raster job fills it.
+pub struct ClutBuf(pub std::cell::UnsafeCell<[u32; 256]>);
+unsafe impl Sync for ClutBuf {}
+unsafe impl Send for ClutBuf {}
+
+impl ClutBuf {
+    pub fn get(&self) -> &[u32; 256] {
+        unsafe { &*self.0.get() }
+    }
+    #[allow(clippy::mut_from_ref)]
+    pub fn get_mut(&self) -> &mut [u32; 256] {
+        unsafe { &mut *self.0.get() }
+    }
+}
+
+/// A CLUT load raster worker 0 does: `out` = `base` (the CLUT before; None: `out` holds it
+/// already) with the load's entries from local memory.
+pub struct ClutJob {
+    pub t: u64,
+    pub texclut: u64,
+    pub base: Option<std::sync::Arc<ClutBuf>>,
+    pub out: std::sync::Arc<ClutBuf>,
+}
+
+/// A host -> local transfer chunk a raster worker stores (`Gs::run_upload`).
+pub struct Upload {
+    pub dbp: u32,
+    pub dbw: u32,
+    pub dpsm: u32,
+    pub dsax: u32,
+    pub dsay: u32,
+    pub rrw: u32,
+    pub rrh: u32,
+    /// Where this chunk starts.
+    pub x: u32,
+    pub y: u32,
+    pub data: Vec<u8>,
+}
+
 /// The finished picture for the front end (RGBA8, `width` x `height`).
 #[derive(Default)]
 pub struct Frame {
@@ -234,6 +273,12 @@ pub struct Context {
 
 pub struct Gs {
     pub mem: Box<[u8]>,
+    /// The GPU rasterizer (default, T5_GPU=0 off): owns local memory then; `mem` is read back from it
+    /// where the CPU needs it (display read-out, local -> host).
+    pub gpu: Option<Box<crate::gpu::GsGpu>>,
+    /// The last value written to each general register (gscap snapshots).
+    pub reg_last: [u64; 128],
+    pub reg_set: [bool; 128],
     pub ctx: [Context; 2],
     pub prim: u64,
     pub prmode: u64,
@@ -270,6 +315,17 @@ pub struct Gs {
     pub clut_tex0: u64,
     /// Hash of `clut` and its format (set by `load_clut`).
     pub clut_hash: u64,
+    /// A CLUT load whose source is still being drawn by raster workers: (TEX0, TEXCLUT, source
+    /// pages, raster batch to wait for). Done when something needs the CLUT or would change its
+    /// source (`realize_clut`), dropped when a later load overwrites the same entries first.
+    pub pending_clut: Option<(u64, u64, [u64; 8], u64)>,
+    /// The CLUT as a raster job leaves it (loads done in the workers' stream, see
+    /// `realize_clut`): `clut` is stale while this is set; `flush_sync` brings it back.
+    pub clut_job: Option<std::sync::Arc<ClutBuf>>,
+    clut_token: u64,
+    /// The raster job that fills `clut_job`.
+    pub clut_job_seq: u64,
+    pending_mask: [u64; 8],
     // Privileged registers.
     pub pmode: u64,
     pub smode1: u64,
@@ -291,9 +347,12 @@ pub struct Gs {
     pub crt_interlace: u32,
     pub crt_mode: u32,
     pub crt_ffmd: u32,
-    pub frame_serial: u64,
+    /// Read-out state (frame serial, last picture hash, last display buffer).
+    pub readout: std::sync::Arc<Mutex<ReadoutState>>,
+    /// The front end's frame and the fields-done counter (read-out as a raster job), set on the
+    /// GS thread.
+    pub job_ctx: Option<(std::sync::Arc<FrameShared>, std::sync::Arc<std::sync::atomic::AtomicU64>)>,
     pub prims: u64,
-    pub last_dispfb: u64,
     /// Write generation per 8 KiB page of local memory (texture cache invalidation).
     pub page_gen: Vec<std::sync::atomic::AtomicU32>,
     /// The resolved state of the last primitive and the register values it came from (PCSX2
@@ -307,21 +366,20 @@ pub struct Gs {
     /// wait for the drawing. Cleared once everything is drawn.
     pub busy_pages: [std::sync::atomic::AtomicU64; 8],
     /// Decoded textures: key -> (generation sum of their pages, image).
-    pub tex_cache: std::collections::HashMap<(u64, u64, u64), (u64, std::sync::Arc<crate::raster::TexImg>)>,
+    pub tex_cache: std::collections::HashMap<(u64, u64, u64), (u64, std::sync::Arc<crate::raster::TexImg>, u64)>,
     /// Primitives queued for drawing (see raster::flush).
     pub batch: crate::raster::Batch,
     /// A batch drawing in the background: signalled when done (see raster::wait).
     pub pending: Option<std::sync::Arc<(Mutex<bool>, std::sync::Condvar)>>,
     /// The raster worker threads (started at the first parallel batch).
     pub workers: Option<Box<crate::raster::Workers>>,
-    /// Hash of the last displayed picture (NEW_PICTURES).
-    last_hash: u64,
 }
 
 impl Gs {
     pub fn new() -> Gs {
         Gs {
             mem: vec![0u8; VRAM].into_boxed_slice(),
+            gpu: None,
             ctx: [Context::default(); 2],
             prim: 0,
             prmode: 0,
@@ -345,6 +403,8 @@ impl Gs {
             signal: 0,
             label: 0,
             verts: Vec::new(),
+            reg_last: [0; 128],
+            reg_set: [false; 128],
             xfer_x: 0,
             xfer_y: 0,
             xfer_active: false,
@@ -353,6 +413,11 @@ impl Gs {
             clut: [0; 256],
             clut_tex0: 0,
             clut_hash: 0,
+            pending_clut: None,
+            clut_job: None,
+            clut_token: 0,
+            clut_job_seq: 0,
+            pending_mask: [0; 8],
             pmode: 0,
             smode1: 0,
             smode2: 0,
@@ -373,9 +438,9 @@ impl Gs {
             crt_interlace: 1,
             crt_mode: 2,
             crt_ffmd: 0,
-            frame_serial: 0,
+            readout: Default::default(),
+            job_ctx: None,
             prims: 0,
-            last_dispfb: 0,
             page_gen: (0..VRAM / 8192).map(|_| std::sync::atomic::AtomicU32::new(0)).collect(),
             st_cache: None,
             st_pages: [0; 8],
@@ -385,8 +450,40 @@ impl Gs {
             batch: Default::default(),
             pending: None,
             workers: None,
-            last_hash: 0,
         }
+    }
+
+    /// CSR.RESET: the general registers (both contexts, TEXA, PRMODE, transfer setup, ...) go
+    /// back to their power-on values; local memory stays (PCSX2 GSState::Reset). Without this a
+    /// program started after another (the loader after Tekken 5) drew with the previous
+    /// program's TEX1 (mipmapping) / TEXA / CLAMP.
+    fn reset_regs(&mut self) {
+        let n = Gs::new(); // rare (program start): the 4 MiB it allocates do not matter
+        self.ctx = n.ctx;
+        self.prim = n.prim;
+        self.prmode = n.prmode;
+        self.prmodecont = n.prmodecont;
+        self.rgbaq = n.rgbaq;
+        self.st = n.st;
+        self.uv = n.uv;
+        self.fog = n.fog;
+        self.texclut = n.texclut;
+        self.scanmsk = n.scanmsk;
+        self.texa = n.texa;
+        self.fogcol = n.fogcol;
+        self.dimx = n.dimx;
+        self.dthe = n.dthe;
+        self.colclamp = n.colclamp;
+        self.pabe = n.pabe;
+        self.bitbltbuf = n.bitbltbuf;
+        self.trxpos = n.trxpos;
+        self.trxreg = n.trxreg;
+        self.trxdir = n.trxdir;
+        self.reg_last = [0; 128];
+        self.reg_set = [false; 128];
+        self.verts.clear();
+        self.xfer_active = false;
+        self.xfer_pending.clear();
     }
 
     // ---- local memory pixel access ----
@@ -483,10 +580,14 @@ impl Gs {
     }
 
     /// Wait for queued drawing if a rectangle of local memory is in use by it.
+    #[track_caller]
     pub fn sync_rect(&mut self, psm: u32, bp: u32, bw: u32, x0: u32, y0: u32, x1: u32, y1: u32) {
-        if self.hits_busy(psm, bp, bw, x0, y0, x1, y1) {
-            crate::raster::flush_sync(self);
-        }
+        let mut mask = [0u64; 8];
+        Self::for_pages(psm, bp, bw, x0, y0, x1, y1, |p| {
+            mask[p >> 6] |= 1 << (p & 63);
+            true
+        });
+        crate::raster::sync_pages(self, &mask);
     }
 
     pub fn touch_rect(&self, psm: u32, bp: u32, bw: u32, x0: u32, y0: u32, x1: u32, y1: u32) {
@@ -580,6 +681,9 @@ impl Gs {
     // ---- general registers (GIF PACKED / REGLIST / A+D) ----
 
     pub fn write_reg(&mut self, reg: u32, v: u64) {
+        let r = (reg & 127) as usize;
+        self.reg_last[r] = v;
+        self.reg_set[r] = true;
         match reg {
             0x00 => {
                 self.prim = v;
@@ -745,15 +849,170 @@ impl Gs {
         self.load_clut(t);
     }
 
+    /// CLUT slots a load writes: all 256 (8-bit), or 16 at CSA (4-bit).
+    fn clut_slots(t: u64) -> (usize, usize) {
+        let psm = ((t >> 20) & 0x3F) as u32;
+        if matches!(psm, PSMT8 | PSMT8H) { (0, 256) } else { ((((t >> 56) & 0x1F) as usize * 16) & 255, 16) }
+    }
+
+    /// Draw on the GPU from now on (default; T5_GPU=0: the CPU reference rasterizer), with the
+    /// current local memory and CLUT. Without a suitable GPU the CPU draws.
+    pub fn enable_gpu(&mut self) {
+        if std::env::var("T5_GPU").map_or(true, |v| v != "0") && self.gpu.is_none() {
+            crate::raster::flush_sync(self);
+            self.gpu = crate::gpu::GsGpu::new(&self.mem, &self.clut).map(Box::new);
+        }
+    }
+
     fn load_clut(&mut self, t: u64) {
         let cbp = ((t >> 37) & 0x3FFF) as u32;
         let cpsm = ((t >> 51) & 0xF) as u32;
+        if self.gpu.is_some() {
+            // In the GPU's stream, after the queued drawing if that writes the palette.
+            let cp = if cpsm == 0 { PSMCT32 } else { cpsm };
+            let mut mask = [0u64; 8];
+            Self::for_pages(cp, cbp, 1, 0, 0, 16, 16, |p| {
+                mask[p >> 6] |= 1 << (p & 63);
+                true
+            });
+            if (t >> 55) & 1 != 0 || crate::raster::batch_touches(self, &mask, false) {
+                crate::raster::flush(self);
+            }
+            let tc = self.texclut;
+            self.gpu.as_mut().unwrap().clut(t, tc);
+            return;
+        }
+        // An earlier deferred load: dropped if this one overwrites the same entries, else done first.
+        if let Some(p) = self.pending_clut {
+            let (a, n) = Self::clut_slots(p.0);
+            let (b, m) = Self::clut_slots(t);
+            if b <= a && a + n <= b + m && (t >> 55) & 1 == 0 {
+                self.pending_clut = None;
+                crate::diag::count("clut load dropped");
+            } else {
+                self.realize_clut();
+            }
+        }
         if (t >> 55) & 1 != 0 {
             crate::raster::flush_sync(self);
         } else {
             let cpsm = if cpsm == 0 { PSMCT32 } else { cpsm };
-            self.sync_rect(cpsm, cbp, 1, 0, 0, 16, 16);
+            // The CLUT lives in the workers' stream: this load goes there too (in order).
+            if self.clut_job.is_some() {
+                let mut mask = [0u64; 8];
+                Self::for_pages(cpsm, cbp, 1, 0, 0, 16, 16, |p| {
+                    mask[p >> 6] |= 1 << (p & 63);
+                    true
+                });
+                let blocks = crate::raster::rect_blocks(cpsm, cbp, 1, 0, 0, 16, 16);
+                let after = crate::raster::flight_using_blocks(self, &mask, Some(&blocks)).unwrap_or(0);
+                self.clut_job_submit(t, self.texclut, mask, after);
+                return;
+            }
+            let mut mask = [0u64; 8];
+            Self::for_pages(cpsm, cbp, 1, 0, 0, 16, 16, |p| {
+                mask[p >> 6] |= 1 << (p & 63);
+                true
+            });
+            let blocks = crate::raster::rect_blocks(cpsm, cbp, 1, 0, 0, 16, 16);
+            if let Some(seq) = crate::raster::flight_using_blocks(self, &mask, Some(&blocks)) {
+                if crate::diag::counting() {
+                    let up = crate::raster::flight_is_upload(self, seq);
+                    crate::diag::count(if up { "clut deferred by upload" } else { "clut deferred by draw" });
+                }
+                self.pending_clut = Some((t, self.texclut, mask, seq));
+                self.pending_mask = mask;
+                return;
+            }
         }
+        self.read_clut(t);
+    }
+
+    /// Do a deferred CLUT load now (waits for the drawing it depends on).
+    #[track_caller]
+    pub fn realize_clut(&mut self) {
+        if let Some((t, texclut, _, seq)) = self.pending_clut.take() {
+            if crate::diag::counting() {
+                let loc = std::panic::Location::caller();
+                crate::diag::count_with(|| format!("clutreal_{}:{}", loc.file().rsplit(['/', '\\']).next().unwrap_or(""), loc.line()));
+            }
+            if crate::raster::safe() {
+                crate::raster::wait_seq(self, seq);
+                let cur = self.texclut;
+                self.texclut = texclut;
+                self.read_clut(t);
+                self.texclut = cur;
+                return;
+            }
+            let mask = self.pending_mask;
+            self.clut_job_submit(t, texclut, mask, seq);
+            crate::diag::count("clut load realized");
+        }
+    }
+
+    /// Hand a CLUT load to raster worker 0 (after batch `after`, on top of the CLUT before it).
+    fn clut_job_submit(&mut self, t: u64, texclut: u64, src_pages: [u64; 8], after: u64) {
+        let out = std::sync::Arc::new(ClutBuf(std::cell::UnsafeCell::new(self.clut)));
+        let base = self.clut_job.clone();
+        self.clut_job_seq = crate::raster::submit_clut(self, ClutJob { t, texclut, base, out: out.clone() }, src_pages, after);
+        self.clut_job = Some(out);
+        self.clut_token += 1;
+        self.clut_hash = 0x5EED_0000_0000_0000 ^ self.clut_token;
+    }
+
+    /// With every raster job done: the CLUT back on this thread (deferred load included).
+    pub fn resolve_clut(&mut self) {
+        if let Some(b) = self.clut_job.take() {
+            self.clut = *b.get();
+            let mut hsh: u64 = 0xcbf2_9ce4_8422_2325;
+            for v in &self.clut {
+                hsh = (hsh ^ *v as u64).wrapping_mul(0x100_0000_01b3);
+            }
+            self.clut_hash = hsh ^ ((self.clut_tex0 >> 51) & 0xF);
+        }
+        if let Some((t, texclut, _, _)) = self.pending_clut.take() {
+            let cur = self.texclut;
+            self.texclut = texclut;
+            self.read_clut(t);
+            self.texclut = cur;
+        }
+    }
+
+    /// Store a CLUT load's entries into `clut` from local memory (as `read_clut`).
+    pub fn read_clut_into(&self, t: u64, texclut: u64, clut: &mut [u32; 256]) {
+        let psm = ((t >> 20) & 0x3F) as u32;
+        let cbp = ((t >> 37) & 0x3FFF) as u32;
+        let cpsm = ((t >> 51) & 0xF) as u32;
+        let csm = (t >> 55) & 1;
+        let csa = ((t >> 56) & 0x1F) as usize;
+        let eight = matches!(psm, PSMT8 | PSMT8H);
+        let n = if eight { 256 } else { 16 };
+        let cpsm = if cpsm == 0 { PSMCT32 } else { cpsm };
+        for i in 0..n {
+            let (x, y) = if csm == 0 {
+                if eight {
+                    let col = (i & 7) | ((i & 0x10) >> 1);
+                    let row = ((i >> 5) << 1) | ((i >> 3) & 1);
+                    (col as u32, row as u32)
+                } else {
+                    ((i & 7) as u32, (i >> 3) as u32)
+                }
+            } else {
+                let cou = ((texclut >> 6) & 0x3F) as u32 * 16;
+                let cov = ((texclut >> 12) & 0x3FF) as u32;
+                (cou + i as u32, cov)
+            };
+            let cbw = if csm == 0 { 1 } else { (texclut & 0x3F) as u32 };
+            let c = self.read_pixel(cpsm, cbp, cbw, x, y);
+            let slot = if eight { i } else { (csa * 16 + i) & 255 };
+            clut[slot] = if cpsm == PSMCT32 || cpsm == PSMCT24 { c } else { c | 0x8000_0000 };
+            if cpsm == PSMCT16 || cpsm == PSMCT16S {
+                clut[slot] = c & 0xFFFF;
+            }
+        }
+    }
+
+    fn read_clut(&mut self, t: u64) {
         let psm = ((t >> 20) & 0x3F) as u32;
         let cbp = ((t >> 37) & 0x3FFF) as u32;
         let cpsm = ((t >> 51) & 0xF) as u32;
@@ -834,11 +1093,43 @@ impl Gs {
         let rrh = ((self.trxreg >> 32) & 0xFFF) as u32;
         let dsax = ((self.trxpos >> 32) & 0x7FF) as u32;
         let dsay = ((self.trxpos >> 48) & 0x7FF) as u32;
-        // Rectangles wrapping at 2048 are rare: wait for everything then.
-        if dsax + rrw > 2048 || dsay + rrh > 2048 {
+        // Rectangles wrapping at 2048 are rare: wait for everything then. Otherwise a transfer
+        // into pages raster batches in flight use becomes a job in their stream (no waiting).
+        let mut defer: Option<(u64, [u64; 8])> = None;
+        if self.gpu.is_some() {
+            // In the GPU's stream, after the queued drawing if that uses the pages.
+            let mut mask = [0u64; 8];
+            Self::for_pages(dpsm, dbp, dbw, dsax, dsay, (dsax + rrw).min(2048), (dsay + rrh).min(2048), |p| {
+                mask[p >> 6] |= 1 << (p & 63);
+                true
+            });
+            if dsax + rrw > 2048 || dsay + rrh > 2048 || crate::raster::batch_touches(self, &mask, true) {
+                crate::raster::flush(self);
+            }
+            defer = Some((0, mask));
+        } else if dsax + rrw > 2048 || dsay + rrh > 2048 {
             crate::raster::flush_sync(self);
         } else {
-            self.sync_rect(dpsm, dbp, dbw, dsax, dsay, dsax + rrw, dsay + rrh);
+            let mut mask = [0u64; 8];
+            Self::for_pages(dpsm, dbp, dbw, dsax, dsay, dsax + rrw, dsay + rrh, |p| {
+                mask[p >> 6] |= 1 << (p & 63);
+                true
+            });
+            if self.pending_clut.is_some_and(|p| (0..8).any(|i| p.2[i] & mask[i] != 0)) {
+                self.realize_clut();
+            }
+            let blocks = crate::raster::rect_blocks(dpsm, dbp, dbw, dsax, dsay, dsax + rrw, dsay + rrh);
+            match crate::raster::flight_using_blocks(self, &mask, Some(&blocks)) {
+                Some(seq) if !crate::diag::enabled("T5_NODEFERUP") && !crate::raster::safe() => {
+                    if crate::diag::counting() {
+                        let up = crate::raster::flight_is_upload(self, seq);
+                        crate::diag::count_with(|| format!("upload deferred {} dbp{dbp:x} {rrw}x{rrh}", if up { "by upload" } else { "by draw" }));
+                    }
+                    defer = Some((seq, mask))
+                }
+                Some(_) => self.sync_rect(dpsm, dbp, dbw, dsax, dsay, dsax + rrw, dsay + rrh),
+                None => {}
+            }
         }
         if rrw == 0 {
             return;
@@ -858,8 +1149,24 @@ impl Gs {
         let rows = (total_bits / bits).div_ceil(rrw as usize) as u32 + 1;
         let y0 = self.xfer_y.max(dsay);
         self.touch_rect(dpsm, dbp, dbw, dsax, y0, dsax + rrw, (y0 + rows).min(dsay + rrh));
+        let (sx, sy) = (self.xfer_x, self.xfer_y);
+        let write = defer.is_none();
         let mut bitpos = 0usize;
-        while bitpos + bits <= total_bits {
+        if self.gpu.is_some() {
+            // The GPU stores the pixels: only advance the position (as the loop below does).
+            let done_px = (self.xfer_y.saturating_sub(dsay) as u64) * rrw as u64 + (self.xfer_x - dsax) as u64;
+            let left = (rrh as u64 * rrw as u64).saturating_sub(done_px);
+            let n = ((total_bits / bits) as u64).min(left);
+            if self.xfer_y >= dsay + rrh {
+                self.xfer_active = false;
+            }
+            let off = (self.xfer_x - dsax) as u64 + n;
+            self.xfer_y += (off / rrw as u64) as u32;
+            self.xfer_x = dsax + (off % rrw as u64) as u32;
+            bitpos = n as usize * bits;
+            used = bitpos.div_ceil(8);
+        }
+        while self.gpu.is_none() && bitpos + bits <= total_bits {
             if self.xfer_y >= dsay + rrh {
                 self.xfer_active = false;
                 break;
@@ -873,13 +1180,22 @@ impl Gs {
                 _ => ((pending[byte] >> (bitpos & 4)) & 15) as u32,
             };
             let (x, y) = (self.xfer_x & 2047, self.xfer_y & 2047);
-            self.store_pixel(dpsm, dbp, dbw, x, y, v);
+            if write {
+                self.store_pixel(dpsm, dbp, dbw, x, y, v);
+            }
             bitpos += bits;
             used = bitpos.div_ceil(8);
             self.xfer_x += 1;
             if self.xfer_x >= dsax + rrw {
                 self.xfer_x = dsax;
                 self.xfer_y += 1;
+            }
+        }
+        if let Some((seq, mask)) = defer {
+            let up = Upload { dbp, dbw, dpsm, dsax, dsay, rrw, rrh, x: sx, y: sy, data: pending[..bitpos.div_ceil(8)].to_vec() };
+            match self.gpu.as_mut() {
+                Some(g) => g.upload(&up),
+                None => crate::raster::submit_upload(self, up, mask, seq),
             }
         }
         if self.xfer_active && used < pending.len() {
@@ -890,8 +1206,43 @@ impl Gs {
         }
     }
 
+    /// Store a deferred host -> local transfer chunk (on a raster worker, see `image_data`).
+    pub fn run_upload(&mut self, u: &Upload) {
+        let bits = match u.dpsm {
+            PSMCT32 | PSMZ32 => 32,
+            PSMCT24 | PSMZ24 => 24,
+            PSMCT16 | PSMCT16S | PSMZ16 | PSMZ16S => 16,
+            PSMT8 | PSMT8H => 8,
+            _ => 4,
+        };
+        let (mut x, mut y) = (u.x, u.y);
+        let total = u.data.len() * 8;
+        let mut bitpos = 0usize;
+        while bitpos + bits <= total && y < u.dsay + u.rrh {
+            let byte = bitpos / 8;
+            let d = &u.data;
+            let v = match bits {
+                32 => u32::from_le_bytes(d[byte..byte + 4].try_into().unwrap()),
+                24 => d[byte] as u32 | (d[byte + 1] as u32) << 8 | (d[byte + 2] as u32) << 16,
+                16 => u16::from_le_bytes([d[byte], d[byte + 1]]) as u32,
+                8 => d[byte] as u32,
+                _ => ((d[byte] >> (bitpos & 4)) & 15) as u32,
+            };
+            self.store_pixel(u.dpsm, u.dbp, u.dbw, x & 2047, y & 2047, v);
+            bitpos += bits;
+            x += 1;
+            if x >= u.dsax + u.rrw {
+                x = u.dsax;
+                y += 1;
+            }
+        }
+    }
+
     fn local_to_host(&mut self, sx: u32, sy: u32) {
         crate::raster::flush_sync(self);
+        if let Some(g) = self.gpu.as_mut() {
+            g.sync_mem(&mut self.mem);
+        }
         let sbp = (self.bitbltbuf & 0x3FFF) as u32;
         let sbw = ((self.bitbltbuf >> 16) & 0x3F) as u32;
         let spsm = ((self.bitbltbuf >> 24) & 0x3F) as u32;
@@ -920,6 +1271,10 @@ impl Gs {
         while bytes.len() % 16 != 0 {
             bytes.push(0);
         }
+        if std::env::var_os("T5_DLLOG").is_some() {
+            let nz = bytes.iter().filter(|&&b| b != 0).count();
+            eprintln!("[dl] bp {sbp:#x} bw {sbw} psm {spsm:#x} at {sx},{sy} {rrw}x{rrh} bytes {} nonzero {nz} head {:02x?}", bytes.len(), &bytes[..bytes.len().min(16)]);
+        }
         self.download.clear();
         for c in bytes.chunks(16) {
             self.download.push_back(u128::from_le_bytes(c.try_into().unwrap()));
@@ -933,6 +1288,38 @@ impl Gs {
 
     fn local_to_local(&mut self, sx: u32, sy: u32, dx: u32, dy: u32) {
         crate::raster::flush_sync(self);
+        if self.gpu.is_some() {
+            let sbp = (self.bitbltbuf & 0x3FFF) as u32;
+            let sbw = ((self.bitbltbuf >> 16) & 0x3F) as u32;
+            let spsm = ((self.bitbltbuf >> 24) & 0x3F) as u32;
+            let dbp = ((self.bitbltbuf >> 32) & 0x3FFF) as u32;
+            let dbw = ((self.bitbltbuf >> 48) & 0x3F) as u32;
+            let dpsm = ((self.bitbltbuf >> 56) & 0x3F) as u32;
+            let rrw = (self.trxreg & 0xFFF) as u32;
+            let rrh = ((self.trxreg >> 32) & 0xFFF) as u32;
+            let dir = ((self.trxpos >> 59) & 3) as u32;
+            // Parallel unless the source and destination pages may overlap (then in order).
+            // Byte range of the page rows a rectangle touches (all of memory if it wraps).
+            let span = |psm: u32, bp: u32, bw: u32, y: u32| -> (u64, u64) {
+                if y + rrh > 2048 || sx + rrw > 2048 || dx + rrw > 2048 {
+                    return (0, u64::MAX);
+                }
+                let ph = match psm {
+                    PSMCT16 | PSMCT16S | PSMZ16 | PSMZ16S | PSMT8 => 64,
+                    PSMT4 => 128,
+                    _ => 32,
+                };
+                let row = (bw.max(1) as u64).div_ceil(if matches!(psm, PSMT8 | PSMT4) { 2 } else { 1 }) * 8192;
+                let base = bp as u64 * 256;
+                (base + (y / ph) as u64 * row, base + (y + rrh).div_ceil(ph) as u64 * row + 8192)
+            };
+            let (s0, s1) = span(spsm, sbp, sbw, sy);
+            let (d0, d1) = span(dpsm, dbp, dbw, dy);
+            let serial = s0 < d1 && d0 < s1;
+            self.touch_rect(dpsm, dbp, dbw, dx.min(2047), dy.min(2047), (dx + rrw).min(2048), (dy + rrh).min(2048));
+            self.gpu.as_mut().unwrap().copy((sbp, sbw, spsm), (dbp, dbw, dpsm), dir, (sx, sy), (dx, dy), (rrw, rrh), serial);
+            return;
+        }
         let sbp = (self.bitbltbuf & 0x3FFF) as u32;
         let sbw = ((self.bitbltbuf >> 16) & 0x3F) as u32;
         let spsm = ((self.bitbltbuf >> 24) & 0x3F) as u32;
@@ -953,90 +1340,52 @@ impl Gs {
     }
 
     /// Vertical blank: read out the display circuits into the front end's frame.
-    pub fn vblank_start(&mut self, shared: &FrameShared, _field: u32) {
-        crate::raster::flush_sync(self);
-        let en1 = self.pmode & 1 != 0;
-        let en2 = self.pmode & 2 != 0;
-        let circuits: Vec<usize> = [(en1, 0usize), (en2, 1)].iter().filter(|c| c.0).map(|c| c.1).collect();
-        if circuits.is_empty() {
-            return;
-        }
-        // Display size from the first enabled circuit (DISPLAY: DW, DH, MAGH).
-        let disp = self.display[circuits[0]];
-        let magh = (((disp >> 23) & 0xF) + 1) as u32;
-        let magv = (((disp >> 27) & 3) + 1) as u32;
-        let mut w = ((((disp >> 32) & 0xFFF) + 1) as u32 / magh).max(1);
-        let mut h = ((((disp >> 44) & 0x7FF) + 1) as u32 / magv).max(1);
-        // SMODE2: INT (interlace), FFMD (1 = FRAME mode: each field reads every line of a
-        // half-height buffer, shown line-doubled; 0 = FIELD mode: the buffer holds the whole
-        // frame and the fields read alternate lines, shown here progressively).
-        let ffmd = self.smode2 & 2 != 0;
-        let interlaced = self.smode2 & 1 != 0;
-        let halve = interlaced && ffmd;
-        w = w.min(2048);
-        h = h.min(2048);
-        let mut out = vec![0u8; (w * h * 4) as usize];
-        let bg = self.bgcolor;
-        // Rows are independent and only read local memory: all cores.
-        use rayon::prelude::*;
-        let gs: &Gs = &*self;
-        out.par_chunks_mut((w * 4) as usize).enumerate().for_each(|(y, line)| {
-            let y = y as u32;
-            for x in 0..w {
-                let mut px = [(bg & 0xFF) as u8, ((bg >> 8) & 0xFF) as u8, ((bg >> 16) & 0xFF) as u8, 0xFF];
-                // Circuit 2 is the bottom layer, circuit 1 blends over it (MMOD / ALP).
-                for &cidx in circuits.iter().rev() {
-                    let fb = gs.dispfb[cidx];
-                    let fbp = ((fb & 0x1FF) * 32) as u32;
-                    let fbw = ((fb >> 9) & 0x3F) as u32;
-                    let psm = ((fb >> 15) & 0x1F) as u32;
-                    let dbx = ((fb >> 32) & 0x7FF) as u32;
-                    let dby = ((fb >> 43) & 0x7FF) as u32;
-                    let sy = if halve { dby + y / 2 } else { dby + y };
-                    let raw = gs.read_pixel(psm, fbp, fbw, (dbx + x) & 2047, sy & 2047);
-                    let (r, g, b, a) = match psm {
-                        PSMCT16 | PSMCT16S => {
-                            let c = raw;
-                            (((c & 31) << 3) as u8, (((c >> 5) & 31) << 3) as u8, (((c >> 10) & 31) << 3) as u8, if c & 0x8000 != 0 { 0x80 } else { 0 })
-                        }
-                        _ => (raw as u8, (raw >> 8) as u8, (raw >> 16) as u8, (raw >> 24) as u8),
-                    };
-                    if cidx == 0 && circuits.len() == 2 {
-                        // Circuit 1 over circuit 2: alpha from PMODE.ALP or the pixel.
-                        let alpha = if gs.pmode & 0x20 != 0 { ((gs.pmode >> 8) & 0xFF) as u32 } else { (a as u32 * 2).min(255) };
-                        let mix = |top: u8, bot: u8| ((top as u32 * alpha + bot as u32 * (255 - alpha)) / 255) as u8;
-                        px = [mix(r, px[0]), mix(g, px[1]), mix(b, px[2]), 0xFF];
-                    } else {
-                        px = [r, g, b, 0xFF];
-                    }
-                }
-                let o = (x * 4) as usize;
-                line[o..o + 4].copy_from_slice(&px);
+    /// Vertical blank: read out the display circuits into the front end's frame. With raster
+    /// workers running this is their job (after the drawing of the displayed pages; it counts
+    /// the field done then), else it happens here after everything is drawn.
+    /// Returns whether the field was counted done already.
+    pub fn vblank_start(&mut self, shared: &FrameShared, _field: u32) -> bool {
+        let r = DisplayRegs { pmode: self.pmode, smode2: self.smode2, dispfb: self.dispfb, display: self.display, bgcolor: self.bgcolor };
+        if self.gpu.is_some() {
+            crate::raster::flush(self);
+            // The GS thread: read out on the read-out thread (counts the field done there).
+            if let Some((sh, done)) = self.job_ctx.clone() {
+                let job = ReadoutJob { regs: r, shared: sh, done, state: self.readout.clone() };
+                self.gpu.as_mut().unwrap().readout_async(job);
+                return true;
             }
-        });
-        self.frame_serial += 1;
-        shared.frames.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // New pictures (the content changed): what the player sees move.
-        let mut ph: u64 = 0xcbf2_9ce4_8422_2325;
-        for c in out.chunks_exact(4).step_by(61) {
-            ph = (ph ^ u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u64).wrapping_mul(0x100_0000_01b3);
+            if let Some(g) = self.gpu.as_mut() {
+                g.sync_mem(&mut self.mem);
+            }
         }
-        if ph != self.last_hash {
-            self.last_hash = ph;
-            NEW_PICTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            PICTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some((sh, done)) = self.job_ctx.clone() {
+            if self.workers.is_some() && !crate::diag::enabled("T5_SYNCREADOUT") && !crate::raster::safe() {
+                let mut mask = [0u64; 8];
+                for cidx in 0..2 {
+                    if r.pmode & (1 << cidx) == 0 {
+                        continue;
+                    }
+                    let fb = r.dispfb[cidx];
+                    let (fbp, fbw, psm) = (((fb & 0x1FF) * 32) as u32, ((fb >> 9) & 0x3F) as u32, ((fb >> 15) & 0x1F) as u32);
+                    let (dbx, dby) = (((fb >> 32) & 0x7FF) as u32, ((fb >> 43) & 0x7FF) as u32);
+                    let disp = r.display[cidx];
+                    let w = (((disp >> 32) & 0xFFF) + 1) as u32;
+                    let h = (((disp >> 44) & 0x7FF) + 1) as u32;
+                    Self::for_pages(psm, fbp, fbw, dbx, dby, (dbx + w).min(2048), (dby + h).min(2048), |p| {
+                        mask[p >> 6] |= 1 << (p & 63);
+                        true
+                    });
+                }
+                let after = crate::raster::flight_using(self, &mask).unwrap_or(0);
+                let job = ReadoutJob { regs: r, shared: sh, done, state: self.readout.clone() };
+                crate::raster::submit_readout(self, job, mask, after);
+                return true;
+            }
         }
-        let fb = self.dispfb[circuits[0]];
-        if fb != self.last_dispfb {
-            self.last_dispfb = fb;
-            shared.flips.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        let mut f = shared.frame.lock().unwrap();
-        f.width = w;
-        f.height = h;
-        f.rgba = out;
-        f.serial = self.frame_serial;
-        crate::FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::raster::flush_sync(self);
+        let mut st = self.readout.lock().unwrap();
+        readout(self, &r, &mut st, shared);
+        false
     }
 }
 
@@ -1122,7 +1471,7 @@ impl GsFront {
         std::thread::Builder::new()
             .name("gs".into())
             .spawn(move || {
-                crate::boost_thread();
+                crate::boost_thread_on(Some(2));
                 #[cfg(windows)]
                 {
                     #[link(name = "kernel32")]
@@ -1132,6 +1481,10 @@ impl GsFront {
                     GS_OS_TID.store(unsafe { GetCurrentThreadId() }, std::sync::atomic::Ordering::Relaxed);
                 }
                 let mut gs = Gs::new();
+                gs.enable_gpu();
+                gs.job_ctx = Some((shared.clone(), done_t.clone()));
+                let mut cap: Option<crate::gscap::Capture> = None;
+                let mut armed = std::env::var_os("T5_GSCAPTURE").is_some();
                 loop {
                     let batch = match rx.try_recv() {
                         Ok(b) => b,
@@ -1144,6 +1497,9 @@ impl GsFront {
                         }
                     };
                     for c in batch {
+                        if armed {
+                            crate::gscap::on_cmd(&gs, &mut cap, &mut armed, &c);
+                        }
                         gs.exec(c, &shared, &done_t);
                     }
                 }
@@ -1196,6 +1552,14 @@ impl GsFront {
 
     /// A general register write from a GIF path.
     pub fn write_reg(&mut self, reg: u32, v: u64) {
+        // T5_TBPWATCH=<tbp>: log which path / VU1 program sets TEX0 to that texture base.
+        if reg & !1 == 6 && crate::diag::enabled("T5_TBPWATCH") {
+            static TBP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            if v & 0x3FFF == *TBP.get_or_init(|| std::env::var("T5_TBPWATCH").ok().and_then(|s| s.parse().ok()).unwrap_or(u64::MAX)) {
+                let p = crate::gif::CUR_PATH.load(R);
+                crate::diag::log(format!("[tbp] field {} vblank {} path {} kick {:#x} vu1 {:#x}", self.sent_fields, crate::VBLANKS.load(R), p >> 16, p & 0xFFFF, crate::gif::VU1_START.load(R)));
+            }
+        }
         match reg {
             0x60 => {
                 // SIGNAL: ID bits under the mask; interrupt unless IMR.SIGMSK.
@@ -1360,6 +1724,11 @@ impl GsFront {
 
 impl Gs {
     /// Run one command on the GS thread.
+    /// `exec` for gs-bench.
+    pub fn exec_pub(&mut self, c: GsCmd, shared: &FrameShared, done: &std::sync::atomic::AtomicU64) {
+        self.exec(c, shared, done)
+    }
+
     fn exec(&mut self, c: GsCmd, shared: &FrameShared, done: &std::sync::atomic::AtomicU64) {
         match c {
             GsCmd::Reg(r, v) => self.write_reg(r, v),
@@ -1368,10 +1737,7 @@ impl Gs {
                 self.image_data(&d);
                 crate::raster::GS_US[3].fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
             }
-            GsCmd::Reset => {
-                self.verts.clear();
-                self.xfer_active = false;
-            }
+            GsCmd::Reset => self.reset_regs(),
             GsCmd::Vsync { pmode, smode2, dispfb, display, bgcolor, field } => {
                 self.pmode = pmode;
                 self.smode2 = smode2;
@@ -1379,14 +1745,138 @@ impl Gs {
                 self.display = display;
                 self.bgcolor = bgcolor;
                 let t0 = std::time::Instant::now();
-                self.vblank_start(shared, field);
+                let counted = self.vblank_start(shared, field);
                 crate::raster::GS_US[4].fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
-                done.fetch_add(1, std::sync::atomic::Ordering::Release);
-                crate::diag::tl("GS fielddone");
+                if !counted {
+                    done.fetch_add(1, std::sync::atomic::Ordering::Release);
+                    crate::diag::tl("GS fielddone");
+                }
             }
             GsCmd::Download(tx) => {
                 let _ = tx.send(self.download.drain(..).collect());
             }
         }
     }
+}
+
+/// Display registers at a vertical blank.
+#[derive(Clone, Copy)]
+pub struct DisplayRegs {
+    pub pmode: u64,
+    pub smode2: u64,
+    pub dispfb: [u64; 2],
+    pub display: [u64; 2],
+    pub bgcolor: u64,
+}
+
+/// What the read-out keeps between fields.
+#[derive(Default)]
+pub struct ReadoutState {
+    pub frame_serial: u64,
+    pub last_dispfb: u64,
+    last_hash: u64,
+}
+
+/// A display read-out raster worker 0 does (`Gs::vblank_start`).
+pub struct ReadoutJob {
+    pub regs: DisplayRegs,
+    pub shared: std::sync::Arc<FrameShared>,
+    pub done: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pub state: std::sync::Arc<Mutex<ReadoutState>>,
+}
+
+impl ReadoutJob {
+    pub fn run(&self, g: &Gs) {
+        let mut st = self.state.lock().unwrap();
+        readout(g, &self.regs, &mut st, &self.shared);
+        drop(st);
+        self.done.fetch_add(1, std::sync::atomic::Ordering::Release);
+        crate::diag::tl("GS fielddone");
+    }
+}
+
+/// Read the display circuits out of local memory into the front end's frame.
+pub fn readout(g: &Gs, dr: &DisplayRegs, st: &mut ReadoutState, shared: &FrameShared) {
+        let en1 = dr.pmode & 1 != 0;
+        let en2 = dr.pmode & 2 != 0;
+        let circuits: Vec<usize> = [(en1, 0usize), (en2, 1)].iter().filter(|c| c.0).map(|c| c.1).collect();
+        if circuits.is_empty() {
+            return;
+        }
+        // Display size from the first enabled circuit (DISPLAY: DW, DH, MAGH).
+        let disp = dr.display[circuits[0]];
+        let magh = (((disp >> 23) & 0xF) + 1) as u32;
+        let magv = (((disp >> 27) & 3) + 1) as u32;
+        let mut w = ((((disp >> 32) & 0xFFF) + 1) as u32 / magh).max(1);
+        let mut h = ((((disp >> 44) & 0x7FF) + 1) as u32 / magv).max(1);
+        // SMODE2: INT (interlace), FFMD (1 = FRAME mode: each field reads every line of a
+        // half-height buffer, shown line-doubled; 0 = FIELD mode: the buffer holds the whole
+        // frame and the fields read alternate lines, shown here progressively).
+        let ffmd = dr.smode2 & 2 != 0;
+        let interlaced = dr.smode2 & 1 != 0;
+        let halve = interlaced && ffmd;
+        w = w.min(2048);
+        h = h.min(2048);
+        let mut out = vec![0u8; (w * h * 4) as usize];
+        let bg = dr.bgcolor;
+        // Rows are independent and only read local memory: all cores.
+        use rayon::prelude::*;
+        let gs: &Gs = g;
+        out.par_chunks_mut((w * 4) as usize).enumerate().for_each(|(y, line)| {
+            let y = y as u32;
+            for x in 0..w {
+                let mut px = [(bg & 0xFF) as u8, ((bg >> 8) & 0xFF) as u8, ((bg >> 16) & 0xFF) as u8, 0xFF];
+                // Circuit 2 is the bottom layer, circuit 1 blends over it (MMOD / ALP).
+                for &cidx in circuits.iter().rev() {
+                    let fb = dr.dispfb[cidx];
+                    let fbp = ((fb & 0x1FF) * 32) as u32;
+                    let fbw = ((fb >> 9) & 0x3F) as u32;
+                    let psm = ((fb >> 15) & 0x1F) as u32;
+                    let dbx = ((fb >> 32) & 0x7FF) as u32;
+                    let dby = ((fb >> 43) & 0x7FF) as u32;
+                    let sy = if halve { dby + y / 2 } else { dby + y };
+                    let raw = gs.read_pixel(psm, fbp, fbw, (dbx + x) & 2047, sy & 2047);
+                    let (r, g, b, a) = match psm {
+                        PSMCT16 | PSMCT16S => {
+                            let c = raw;
+                            (((c & 31) << 3) as u8, (((c >> 5) & 31) << 3) as u8, (((c >> 10) & 31) << 3) as u8, if c & 0x8000 != 0 { 0x80 } else { 0 })
+                        }
+                        _ => (raw as u8, (raw >> 8) as u8, (raw >> 16) as u8, (raw >> 24) as u8),
+                    };
+                    if cidx == 0 && circuits.len() == 2 {
+                        // Circuit 1 over circuit 2: alpha from PMODE.ALP or the pixel.
+                        let alpha = if dr.pmode & 0x20 != 0 { ((dr.pmode >> 8) & 0xFF) as u32 } else { (a as u32 * 2).min(255) };
+                        let mix = |top: u8, bot: u8| ((top as u32 * alpha + bot as u32 * (255 - alpha)) / 255) as u8;
+                        px = [mix(r, px[0]), mix(g, px[1]), mix(b, px[2]), 0xFF];
+                    } else {
+                        px = [r, g, b, 0xFF];
+                    }
+                }
+                let o = (x * 4) as usize;
+                line[o..o + 4].copy_from_slice(&px);
+            }
+        });
+        st.frame_serial += 1;
+        shared.frames.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // New pictures (the content changed): what the player sees move.
+        let mut ph: u64 = 0xcbf2_9ce4_8422_2325;
+        for c in out.chunks_exact(4).step_by(61) {
+            ph = (ph ^ u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u64).wrapping_mul(0x100_0000_01b3);
+        }
+        if ph != st.last_hash {
+            st.last_hash = ph;
+            NEW_PICTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            PICTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let fb = dr.dispfb[circuits[0]];
+        if fb != st.last_dispfb {
+            st.last_dispfb = fb;
+            shared.flips.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let mut f = shared.frame.lock().unwrap();
+        f.width = w;
+        f.height = h;
+        f.rgba = out;
+        f.serial = st.frame_serial;
+        crate::FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }

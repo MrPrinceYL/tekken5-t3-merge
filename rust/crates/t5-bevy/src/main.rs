@@ -48,8 +48,27 @@ fn main() {
     std::thread::Builder::new()
         .name("ps2-ee".into())
         .stack_size(512 << 20)
-        .spawn(|| t5_recomp::run())
+        .spawn(|| {
+            #[cfg(windows)]
+            t5_recomp::profile::mark_guest();
+            t5_recomp::run()
+        })
         .expect("spawn guest thread");
+    // T5_PROFILE=<second>: sample a thread (T5_PROFILE_MTVU / _GS / _RASTER, else the guest)
+    // for T5_PROFILE_SECS (default 30) seconds from that game second on; result in t5_trace.log.
+    #[cfg(windows)]
+    if let Some(start) = std::env::var("T5_PROFILE").ok().and_then(|v| v.parse::<f64>().ok()) {
+        let span = std::env::var("T5_PROFILE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
+        std::thread::spawn(move || {
+            while ps2_runtime::secs() < start {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            ps2_runtime::diag::log(format!("profile: sampling {span} s"));
+            t5_recomp::profile::report(t5_recomp::profile::run(span));
+        });
+    }
+    // Measurement runs: `--press BUTTON@SECOND` as in t5-headless.
+    t5_recomp::script::init(&std::env::args().collect::<Vec<_>>());
     start_audio(shared.audio.clone());
 
     let mut app = App::new();
@@ -66,7 +85,7 @@ fn main() {
         .insert_resource(settings::Settings::load())
         .init_resource::<settings::MenuState>()
         .add_systems(Startup, (setup, input::setup_menu, settings::setup, settings::setup_fps))
-        .add_systems(Update, (show_frame, input::read_input, input::menu, settings::menu, fps_counter, update_status, toggle_overlay))
+        .add_systems(Update, (show_frame, input::read_input, input::menu, settings::menu, fps_counter, update_status, toggle_overlay, fast_forward))
         .run();
 }
 
@@ -193,6 +212,18 @@ fn setup(
     });
 }
 
+/// Window runs: `T5_SHOTS=<dir>` saves the picture once per second of device time.
+fn shot(w: u32, h: u32, rgba: &[u8]) {
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+    static DIR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let Some(dir) = DIR.get_or_init(|| std::env::var("T5_SHOTS").ok()) else { return };
+    let sec = ps2_runtime::secs() as u64;
+    if LAST.swap(sec, std::sync::atomic::Ordering::Relaxed) != sec {
+        let _ = std::fs::create_dir_all(dir);
+        let _ = t5_recomp::write_png(&format!("{dir}/shot_{sec:04}.png"), w, h, rgba);
+    }
+}
+
 fn show_frame(
     mut screen: ResMut<Screen>,
     mut images: ResMut<Assets<Image>>,
@@ -217,6 +248,7 @@ fn show_frame(
     if s.buf.rgba.len() != (w * h * 4) as usize {
         return;
     }
+    shot(w, h, &s.buf.rgba);
     if s.size != (w, h) || restyle {
         let old = std::mem::replace(&mut s.image, images.add(new_image(w, h, s.smooth)));
         images.remove(&old);
@@ -253,7 +285,8 @@ fn fps_counter(
     // The game's own logic frame counter: displayed pictures and copy passes repeat every
     // field and would always read 60.
     let logic = ps2_runtime::machine_opt().map(|m| ps2_runtime::logic_frames(m) as u64).unwrap_or(0);
-    settings::update_fps(logic, screen.frames.flips(), &settings, &mut w, &mut q);
+    let rendered = ps2_runtime::raster::RENDERED_TOTAL.load(Relaxed);
+    settings::update_fps(rendered, logic, screen.frames.flips(), &settings, &mut w, &mut q);
 }
 
 fn update_status(screen: Option<Res<Screen>>, mut q: Query<(&mut Text, &Visibility), With<StatusText>>) {
@@ -276,6 +309,11 @@ fn update_status(screen: Option<Res<Screen>>, mut q: Query<(&mut Text, &Visibili
     for (mut t, _) in &mut q {
         t.0 = s.clone();
     }
+}
+
+/// F3 held: skip the idle time between frames (fast forward, `ps2_runtime::WARP_KEY`).
+fn fast_forward(keys: Res<ButtonInput<KeyCode>>) {
+    ps2_runtime::WARP_KEY.store(keys.pressed(KeyCode::F3), Relaxed);
 }
 
 fn toggle_overlay(keys: Res<ButtonInput<KeyCode>>, mut q: Query<&mut Visibility, With<StatusText>>) {

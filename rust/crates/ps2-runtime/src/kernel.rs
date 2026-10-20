@@ -248,7 +248,7 @@ pub fn wake_ee() {
 
 pub fn run() -> ! {
     let _ = EE_THREAD.set(std::thread::current());
-    crate::boost_thread();
+    crate::boost_thread_on(Some(0));
     let m = machine();
     let boot = boot_path(m);
     diag::log(format!("boot: {boot}"));
@@ -409,16 +409,50 @@ fn maybe_preempt() {
     }
 }
 
-/// No thread is ready: let time pass until something happens.
-fn idle() {
-    let m = machine();
-    let now = m.now();
+/// Device time of the next scheduled event (vblank, alarm, IOP, SIF, timer).
+fn next_event(m: &Machine) -> u64 {
     let mut next = m.next_vblank.min(if m.in_vblank { m.vblank_end } else { u64::MAX });
     for a in &m.kernel.alarms {
         next = next.min(a.due);
     }
-    next = next.min(crate::iop::next_event(m)).min(crate::sif::next_event(m)).min(crate::timers::next_event(m));
-    if next > now {
+    next.min(crate::iop::next_event(m)).min(crate::sif::next_event(m)).min(crate::timers::next_event(m))
+}
+
+/// Warp: jump to the next event instead of waiting for it, but only when the MTVU worker has
+/// nothing left (its results would otherwise land late in device time).
+fn try_warp(m: &Machine, now: u64, next: u64) -> bool {
+    let quiet = m.mtvu.as_ref().map_or(true, |t| t.quiet()) && crate::mtvu::RAISED.load(Relaxed) == 0;
+    if next > now && crate::warp_on(now) && quiet {
+        crate::WARP.fetch_add(next - now, Relaxed);
+        crate::diag::tl("EE warp");
+        return true;
+    }
+    false
+}
+
+/// INTC_STAT read: the same value many times in a row is a wait loop (libkernl `VSync` polls
+/// it with interrupts off, 0x10F830) - as idle as a parked thread, so warp skips it too.
+pub fn poll_istat(m: &Machine) {
+    static POLL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let last = POLL.load(Relaxed);
+    let n = if last >> 32 == m.istat as u64 { (last & 0xFFFF_FFFF) + 1 } else { 0 };
+    POLL.store((m.istat as u64) << 32 | n, Relaxed);
+    if n >= 8 {
+        let now = m.now();
+        if try_warp(m, now, next_event(m)) {
+            // The next service point raises what is now due.
+            ATTENTION.store(true, Relaxed);
+            POLL.store((m.istat as u64) << 32, Relaxed);
+        }
+    }
+}
+
+/// No thread is ready: let time pass until something happens.
+fn idle() {
+    let m = machine();
+    let now = m.now();
+    let next = next_event(m);
+    if !try_warp(m, now, next) && next > now {
         let ns = ((next - now) as u128 * 1_000_000_000 / crate::EE_HZ as u128) as u64;
         crate::diag::tl("EE idle");
         let t0 = std::time::Instant::now();
@@ -590,7 +624,9 @@ pub fn take_interrupts(c: &mut Ctx) {
 
 fn call_handler(c: &mut Ctx, func: u32, gp: u32, args: &[u64]) {
     let t0 = std::time::Instant::now();
+    let prev = CUR_HANDLER.swap(func, Relaxed);
     call_handler_inner(c, func, gp, args);
+    CUR_HANDLER.store(prev, Relaxed);
     let us = t0.elapsed().as_micros() as u64;
     if us > 2000 {
         diag::count_with(|| format!("slow handler {func:#x} (cause {})", args.first().copied().unwrap_or(0)));
@@ -1113,7 +1149,13 @@ fn release_wait(m: &mut Machine, tid: usize) -> i64 {
     tid as i64
 }
 
+/// The interrupt handler running (for the timeline).
+static CUR_HANDLER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 fn wakeup(m: &mut Machine, tid: usize) -> i64 {
+    if diag::enabled("T5_TIMELINE") {
+        diag::tl(&format!("K wake t{tid} irq{} h{:x}", m.kernel.in_irq as u8, CUR_HANDLER.load(Relaxed)));
+    }
     let Some(t) = m.kernel.threads.get_mut(tid).and_then(|x| x.as_mut()) else { return -1 };
     if t.status == THS_WAIT && t.wait_type == TSW_SLEEP {
         t.wake_result = tid as i32;
@@ -1160,6 +1202,9 @@ fn delete_sema(m: &mut Machine, s: usize) -> i64 {
 }
 
 fn signal_sema(m: &mut Machine, s: usize) -> i64 {
+    if diag::enabled("T5_TIMELINE") {
+        diag::tl(&format!("K sig s{s} irq{} h{:x}", m.kernel.in_irq as u8, CUR_HANDLER.load(Relaxed)));
+    }
     let Some(sm) = m.kernel.semas.get_mut(s).and_then(|x| x.as_mut()) else { return -0x1A0 };
     if !sm.waiters.is_empty() {
         let w = sm.waiters.remove(0) as usize;
@@ -1185,13 +1230,24 @@ fn wait_sema(m: &mut Machine, s: usize) -> i64 {
         return -1;
     }
     sm.waiters.push(cur as u32);
+    if diag::enabled("T5_TIMELINE") {
+        diag::tl(&format!("K wait s{s} t{cur}"));
+    }
     if let Some(t) = m.kernel.cur() {
         t.status = THS_WAIT;
         t.wait_type = TSW_SEMA;
         t.wait_id = s as u32;
         t.wake_result = s as i32;
     }
-    block() as i64
+    let log = diag::enabled("T5_CDLOG");
+    if log {
+        diag::log(format!("ee wait t{cur} s{s} at {}", m.now()));
+    }
+    let r = block() as i64;
+    if log {
+        diag::log(format!("ee woke t{cur} s{s} at {}", machine().now()));
+    }
+    r
 }
 
 fn refer_sema(m: &mut Machine, s: usize, info: u32) -> i64 {
@@ -1288,5 +1344,11 @@ pub fn unknown_call(c: &mut Ctx, addr: u32) -> bool {
         m.function_name(ee_core::LAST_FN.load(Relaxed)).unwrap_or("?"),
         c.gpr32(GPR_RA)
     ));
+    // T5_DUMPUNK=1: the 64 KiB at the target (what code the program put there).
+    if diag::enabled("T5_DUMPUNK") {
+        let base = (addr as usize) & (ee_core::RAM_SIZE - 1);
+        let end = (base + 0x10000).min(m.ram.len());
+        let _ = std::fs::write(format!("unk_{addr:08x}.bin"), &m.ram[base..end]);
+    }
     false
 }

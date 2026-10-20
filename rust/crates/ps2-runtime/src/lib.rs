@@ -20,6 +20,7 @@ pub mod diag;
 pub mod disc;
 pub mod dmac;
 pub mod gif;
+pub mod gpu;
 pub mod gs;
 pub mod iop;
 pub mod ipu;
@@ -33,6 +34,8 @@ pub mod spu2;
 pub mod timers;
 pub mod vif;
 pub mod vu;
+pub mod vuc;
+pub mod gscap;
 
 pub use ee_core::{Ctx, Host, BLOCK_MISSES, CALLS, FN_ENTRIES, LAST_FN, UNKNOWN_TARGETS};
 use ee_core::ATTENTION;
@@ -64,6 +67,34 @@ pub const INTC_TIM0: u32 = 9;
 /// Vertical blanks and displayed frames so far.
 pub static VBLANKS: AtomicU64 = AtomicU64::new(0);
 pub static FRAMES: AtomicU64 = AtomicU64::new(0);
+
+/// Device time skipped while nothing was running (EE cycles, see `kernel::idle`).
+pub static WARP: AtomicU64 = AtomicU64::new(0);
+/// Fast-forward key held in the window.
+pub static WARP_KEY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Skip idle time now? `WARP_KEY` held, or `T5_WARP`: `1` = always, else device-second ranges
+/// `a-b,c-` (e.g. `0-70` = up to second 70, then real time).
+pub fn warp_on(now: u64) -> bool {
+    static RANGES: std::sync::OnceLock<Vec<(f64, f64)>> = std::sync::OnceLock::new();
+    let r = RANGES.get_or_init(|| {
+        let v = std::env::var("T5_WARP").unwrap_or_default();
+        if v.trim() == "1" {
+            return vec![(0.0, f64::MAX)];
+        }
+        v.split(',')
+            .filter_map(|p| p.split_once('-'))
+            .map(|(a, b)| (a.trim().parse().unwrap_or(0.0), b.trim().parse().unwrap_or(f64::MAX)))
+            .collect()
+    });
+    let s = now as f64 / EE_HZ as f64;
+    WARP_KEY.load(Relaxed) || r.iter().any(|&(a, b)| s >= a && s < b)
+}
+
+/// Device seconds since boot (the clock of `--press` and the timed diagnostics).
+pub fn secs() -> f64 {
+    machine_opt().map(|m| m.now() as f64 / EE_HZ as f64).unwrap_or(0.0)
+}
 
 /// One of the game's programs (generated from sheets/variants.csv).
 pub struct Program {
@@ -152,6 +183,90 @@ pub fn machine() -> &'static mut Machine {
 /// Raise the calling thread's priority (the EE, MTVU and GS threads: the raster pool must not
 /// push them off the CPU).
 pub fn boost_thread() {
+    boost_thread_on(None)
+}
+
+/// The physical cores (as logical-processor masks) from Windows, in order.
+#[cfg(windows)]
+fn core_masks() -> &'static [u64] {
+    static M: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        #[repr(C)]
+        struct Info {
+            mask: usize,
+            relationship: u32,
+            _rest: [u64; 2],
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetLogicalProcessorInformation(buf: *mut Info, len: *mut u32) -> i32;
+        }
+        let mut len: u32 = 0;
+        unsafe { GetLogicalProcessorInformation(std::ptr::null_mut(), &mut len) };
+        let n = len as usize / std::mem::size_of::<Info>();
+        let mut v: Vec<Info> = (0..n).map(|_| Info { mask: 0, relationship: 0, _rest: [0; 2] }).collect();
+        if n == 0 || unsafe { GetLogicalProcessorInformation(v.as_mut_ptr(), &mut len) } == 0 {
+            return Vec::new();
+        }
+        // RelationProcessorCore = 0
+        let mut cores: Vec<u64> = v.iter().filter(|i| i.relationship == 0).map(|i| i.mask as u64).collect();
+        cores.sort();
+        cores
+    })
+}
+
+/// Threads on the critical path get a physical core of their own (no SMT sibling): slot 0 the
+/// EE, 1 the MTVU worker, 2 the GS thread; the raster workers run on the other cores
+/// (`raster_mask`). T5_AFFINITY: "0" (default) none, "w" only the MTVU worker, "1" all three.
+pub fn critical_core(slot: usize) -> Option<u64> {
+    #[cfg(windows)]
+    {
+        let mode = std::env::var("T5_AFFINITY").unwrap_or_else(|_| "0".into());
+        let c = core_masks();
+        if c.len() < 6 || mode == "0" || (mode == "w" && slot != 1) {
+            return None;
+        }
+        return Some(c[slot]);
+    }
+    let _ = slot;
+    None
+}
+
+/// The logical processors left for the raster workers (None: no pinning).
+pub fn raster_mask() -> Option<u64> {
+    #[cfg(windows)]
+    {
+        // Mode "w": only the MTVU worker has a core of its own; else EE, worker, GS.
+        let reserved: Vec<u64> = (0..3).filter_map(critical_core).collect();
+        if reserved.is_empty() {
+            return None;
+        }
+        let all = core_masks().iter().fold(0, |a, m| a | m);
+        return Some(reserved.iter().fold(all, |a, m| a & !m));
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+/// Restrict the calling thread to the logical processors in `mask`.
+pub fn set_affinity(mask: u64) {
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetCurrentThread() -> isize;
+            fn SetThreadAffinityMask(h: isize, m: usize) -> usize;
+        }
+        unsafe { SetThreadAffinityMask(GetCurrentThread(), mask as usize) };
+    }
+    let _ = mask;
+}
+
+/// Raise the calling thread's priority and, for a critical thread, give it its core.
+pub fn boost_thread_on(slot: Option<usize>) {
+    if let Some(m) = slot.and_then(critical_core) {
+        set_affinity(m);
+    }
     #[cfg(windows)]
     {
         #[link(name = "kernel32")]
@@ -173,7 +288,7 @@ impl Machine {
     #[inline]
     pub fn now(&self) -> u64 {
         let ns = self.start.elapsed().as_nanos();
-        ((ns * EE_HZ as u128 / 1_000_000_000) as u64).saturating_sub(self.skew)
+        ((ns * EE_HZ as u128 / 1_000_000_000) as u64 + WARP.load(Relaxed)).saturating_sub(self.skew)
     }
 
     /// Request an INTC interrupt; delivered at the next service point.
@@ -246,6 +361,9 @@ impl Machine {
             ));
         }
         self.cur = found;
+        if diag::enabled("T5_DUMPUNK") {
+            let _ = std::fs::write(format!("atexec_{entry:08x}.bin"), &self.ram[0x1E7_3800..0x1E7_3900]);
+        }
     }
 }
 
@@ -434,6 +552,23 @@ pub fn service(c: &mut Ctx) {
         m.field ^= 1;
         VBLANKS.fetch_add(1, Relaxed);
         diag::tl("EE vblank");
+        // T5_CDLOG: queue fill of the movie player (Namco stream player, thread entry 0x319CD8,
+        // argument = player object): free list +0x40D4, stream queues +0x40F8 + i*0x24 (count +0x1C).
+        if diag::enabled("T5_CDLOG") {
+            if let Some(obj) = m.kernel.threads.iter().flatten().find(|t| t.entry == 0x0031_9CD8).map(|t| t.arg) {
+                let n = |q: u32| bus::ram_read(m, q + 0x1C, 4);
+                diag::log(format!("player queues at {now}: free {} s0 {} s1 {} s2 {} s3 {}", n(obj + 0x40D4), n(obj + 0x40F8), n(obj + 0x411C), n(obj + 0x4140), n(obj + 0x4164)));
+            }
+        }
+        // T5_COVERFIELD=1: the EE functions entered in each field (coverfield.txt).
+        if diag::enabled("T5_COVERFIELD") {
+            ee_core::COVER_ON.store(true, Relaxed);
+            let hit: Vec<String> = ee_core::cover_take().iter().map(|a| format!("{a:X}")).collect();
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("coverfield.txt") {
+                use std::io::Write;
+                let _ = writeln!(f, "{} {}", VBLANKS.load(Relaxed), hit.join(" "));
+            }
+        }
         if let Some(t) = m.mtvu.as_mut() {
             let (pmode, smode2, dispfb, display, bgcolor) = m.gs.display_regs();
             t.send(mtvu::Cmd::Vsync { pmode, smode2, dispfb, display, bgcolor, field: m.field });

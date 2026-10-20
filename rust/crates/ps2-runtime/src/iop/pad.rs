@@ -1,6 +1,6 @@
 //! padman (RPC 0x80000100 / 0x80000101) for libpad 3.0 (SLUS 0x0010B900..0x0010CE68): commands
-//! in a 0x80-byte buffer (word 0 command, +4 port, +8 slot, +0x10 argument; reply word 3 result,
-//! word 5 extra), and per open port two 0x80-byte `pad_data` records in EE memory that padman
+//! in a 0x80-byte buffer (word 0 command, +4 port, +8 slot, +0x10 argument; the result word
+//! depends on the command, see the end of `call`), and per open port two 0x80-byte `pad_data` records in EE memory that padman
 //! rewrites every frame, alternating, with a growing frame count (libpad reads the newer one).
 //!
 //! pad_data: +0x00 data[32] (the controller's reply: 0x00, mode id, buttons (active low),
@@ -74,7 +74,15 @@ pub fn call(m: &mut Machine, sid: u32, d: &[u8], recv: usize) -> Reply {
             _ => diag::once(format!("pad: command {cmd:#x}")),
         }
     }
-    set(&mut r, 0x0C, result);
+    // Where libpad reads each command's result (main 0x10BD58.., devil 0x2615A0..).
+    let at = match cmd {
+        0x06 | 0x08 => 0x14,
+        0x0A => 0x10,
+        0x0B => 0x1C,
+        0x14 => 0x08,
+        _ => 0x0C,
+    };
+    set(&mut r, at, result);
     Reply::Now(r)
 }
 
@@ -118,7 +126,10 @@ pub fn update(m: &mut Machine) {
         rec[0x50..0x54].copy_from_slice(&[4, 0, 7, 0]);
         rec[0x58..0x5C].copy_from_slice(&frame.to_le_bytes());
         rec[0x60..0x64].copy_from_slice(&(len as u32).to_le_bytes());
-        rec[0x64] = 1; // modeConfig
+        // modeConfig: padman writes 2 when the controller answers the config-mode query
+        // (DualShock 2), 1 after ten failed tries. libpad's InfoMode(CUREXID) returns 0 for 1, and
+        // the game (0x239658) then never asks for analog mode, so the sticks stay at 0x80.
+        rec[0x64] = 2;
         rec[0x65] = mode;
         rec[0x66] = 3; // model: DualShock 2
         rec[0x67] = 1;

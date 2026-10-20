@@ -126,7 +126,7 @@ impl Mtvu {
             .name("mtvu".into())
             .spawn(move || {
                 ON_WORKER.with(|w| w.set(true));
-                crate::boost_thread();
+                crate::boost_thread_on(Some(1));
                 #[cfg(windows)]
                 {
                     #[link(name = "kernel32")]
@@ -196,6 +196,11 @@ impl Mtvu {
     /// Work is queued or running (VPU-STAT VU1 busy).
     pub fn busy(&self) -> bool {
         self.shared.done.load(Acquire) < self.sent
+    }
+
+    /// Nothing queued, running or waiting to be applied (warp may skip ahead).
+    pub fn quiet(&self) -> bool {
+        !self.busy() && self.shared.finished.lock().unwrap().is_empty() && self.shared.stall_regs.lock().unwrap().is_none()
     }
 
     /// VIF1 FBRST (releases a stall).

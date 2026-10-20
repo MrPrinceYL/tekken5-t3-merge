@@ -44,6 +44,10 @@ impl PadShared {
         self.buttons[port].store(buttons, Relaxed);
         self.connected[port].store(connected, Relaxed);
     }
+    /// RX, RY, LX, LY bytes (0x80 = centre; 0 = all centred).
+    pub fn set_sticks(&self, port: usize, sticks: u32) {
+        self.sticks[port].store(sticks, Relaxed);
+    }
     pub fn get(&self, port: usize) -> (u16, bool) {
         (self.buttons[port].load(Relaxed), self.connected[port].load(Relaxed))
     }

@@ -25,6 +25,50 @@ pub fn run() -> ! {
     ps2_runtime::kernel::run()
 }
 
+/// Scripted pad presses for measurement runs (t5-headless, and t5-bevy for window runs):
+/// `--press BUTTON@SECOND` (BUTTON: START, CROSS, CIRCLE, SQUARE, TRIANGLE, UP, DOWN, LEFT, RIGHT), held for
+/// T5_HOLD seconds (default 0.5), counted from `script::init`.
+pub mod script {
+    use std::sync::OnceLock;
+
+    static SCRIPT: OnceLock<(f64, Vec<(u16, f64)>)> = OnceLock::new();
+
+    /// Read the presses from the command line (seconds of device time, `ps2_runtime::secs`, so
+    /// they keep their place under `T5_WARP`); false when there are none.
+    pub fn init(args: &[String]) -> bool {
+        let mut presses = Vec::new();
+        for w in args.windows(2).filter(|w| w[0] == "--press") {
+            if let Some((b, t)) = w[1].split_once('@') {
+                let bit = match b {
+                    "START" => ps2_runtime::pad::START,
+                    "CROSS" => ps2_runtime::pad::CROSS,
+                    "CIRCLE" => ps2_runtime::pad::CIRCLE,
+                    "SQUARE" => ps2_runtime::pad::SQUARE,
+                    "TRIANGLE" => ps2_runtime::pad::TRIANGLE,
+                    "UP" => ps2_runtime::pad::UP,
+                    "DOWN" => ps2_runtime::pad::DOWN,
+                    "LEFT" => ps2_runtime::pad::LEFT,
+                    "RIGHT" => ps2_runtime::pad::RIGHT,
+                    _ => 0,
+                };
+                presses.push((bit, t.parse().unwrap_or(0.0)));
+            }
+        }
+        // T5_HOLD=<seconds>: how long a press is held (menus repeat when held long).
+        let hold = std::env::var("T5_HOLD").ok().and_then(|v| v.parse().ok()).unwrap_or(0.5);
+        let some = !presses.is_empty();
+        let _ = SCRIPT.set((hold, presses));
+        some
+    }
+
+    /// The scripted buttons held right now.
+    pub fn held() -> u16 {
+        let Some((hold, presses)) = SCRIPT.get() else { return 0 };
+        let t = ps2_runtime::secs();
+        presses.iter().filter(|(_, at)| t >= *at && t < at + hold).fold(0, |a, (b, _)| a | b)
+    }
+}
+
 /// Write an RGBA image as a PNG (stored deflate blocks: no compression library needed).
 pub fn write_png(path: &str, w: u32, h: u32, rgba: &[u8]) -> std::io::Result<()> {
     fn crc32(data: &[u8]) -> u32 {
@@ -176,14 +220,14 @@ pub mod profile {
             let mut v: Vec<_> = by_line.into_iter().collect();
             v.sort_by(|a, b| b.1.cmp(&a.1));
             for (name, n) in v.iter().take(60) {
-                eprintln!("[profile-line] {:5.1}% {name}", *n as f64 * 100.0 / total.max(1) as f64);
+                ps2_runtime::diag::log(format!("[profile-line] {:5.1}% {name}", *n as f64 * 100.0 / total.max(1) as f64));
             }
         }
         let mut v: Vec<_> = by_fn.into_iter().collect();
         v.sort_by(|a, b| b.1.cmp(&a.1));
-        eprintln!("[profile] {total} samples");
+        ps2_runtime::diag::log(format!("[profile] {total} samples"));
         for (name, n) in v.iter().take(40) {
-            eprintln!("[profile] {:5.1}% {name}", *n as f64 * 100.0 / total.max(1) as f64);
+            ps2_runtime::diag::log(format!("[profile] {:5.1}% {name}", *n as f64 * 100.0 / total.max(1) as f64));
         }
     }
 }

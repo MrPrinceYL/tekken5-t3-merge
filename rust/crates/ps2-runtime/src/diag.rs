@@ -46,7 +46,7 @@ pub static COUNTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 
 #[inline]
 pub fn counting() -> bool {
-    COUNTING.load(Relaxed) || enabled("T5_PRIMSTATS")
+    COUNTING.load(Relaxed) || enabled("T5_PRIMSTATS") || enabled("T5_FLUSHSTATS")
 }
 
 /// `T5_TIMELINE=1`: time-stamped pipeline events (EE / MTVU worker / GS thread) in the log.
@@ -56,6 +56,13 @@ pub fn tl(ev: &str) {
         static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
         let us = T0.get_or_init(std::time::Instant::now).elapsed().as_micros();
         log(format!("TL {us} {ev}"));
+    }
+}
+
+/// Add `n` to an event counter.
+pub fn add(what: &str, n: u64) {
+    if counting() {
+        *COUNTS.lock().unwrap().entry(what.to_string()).or_insert(0) += n;
     }
 }
 
@@ -75,6 +82,9 @@ pub fn count_with(what: impl FnOnce() -> String) {
 
 /// Periodic summary (every few seconds of guest time).
 pub fn summary(m: &crate::Machine) {
+    if enabled("T5_VUSHAPES") {
+        crate::vu::dump_shapes();
+    }
     let counts: Vec<String> = COUNTS.lock().unwrap().iter().map(|(k, v)| format!("{k}={v}")).collect();
     let t: Vec<u64> = TIME.iter().map(|x| x.swap(0, Relaxed) / 1000).collect();
     if enabled("T5_COVER") {
@@ -87,7 +97,7 @@ pub fn summary(m: &crate::Machine) {
         }
     }
     log(format!("GS display: pmode {:#x} dispfb1 {:#x} display1 {:#x} dispfb2 {:#x} display2 {:#x} smode2 {:#x} bg {:#x}", m.gs.pmode, m.gs.dispfb[0], m.gs.display[0], m.gs.dispfb[1], m.gs.display[1], m.gs.smode2, m.gs.bgcolor));
-    log(format!("VU pairs in last period: VU0 {} VU1 {} (cycles {} / {})", crate::vu::VU_STEPS[0].swap(0, Relaxed), crate::vu::VU_STEPS[1].swap(0, Relaxed), crate::vu::VU_CYCLES[0].swap(0, Relaxed), crate::vu::VU_CYCLES[1].swap(0, Relaxed)));
+    log(format!("VU pairs in last period: VU0 {} VU1 {} (cycles {} / {}) | XGKICK {} ms ({} kicks)", crate::vu::VU_STEPS[0].swap(0, Relaxed), crate::vu::VU_STEPS[1].swap(0, Relaxed), crate::vu::VU_CYCLES[0].swap(0, Relaxed), crate::vu::VU_CYCLES[1].swap(0, Relaxed), crate::vu::XGKICK_NS.swap(0, Relaxed) / 1_000_000, crate::vu::XGKICKS.swap(0, Relaxed)));
     if let Some(t) = m.mtvu.as_ref() {
         log(format!("{} | VIF1 stopped {} stat {:#x} | DMA ch1 chcr {:#x} ch2 chcr {:#x} | istat {:#x} imask {:#x}", t.status(), m.vif[1].stopped, m.vif[1].stat, m.dmac.ch[1].chcr, m.dmac.ch[2].chcr, m.istat, m.imask));
     }
@@ -149,8 +159,8 @@ pub fn enabled(var: &'static str) -> bool {
     let set = SET.get_or_init(|| {
         std::env::vars_os()
             .map(|(k, _)| k.to_string_lossy().into_owned())
-            // T5_DISC / T5_MEMCARD / T5_WAVDUMP / T5_MOD are settings, not diagnostics.
-            .filter(|k| k.starts_with("T5_") && !matches!(k.as_str(), "T5_DISC" | "T5_MEMCARD" | "T5_WAVDUMP" | "T5_MOD"))
+            // T5_DISC / T5_MEMCARD / T5_MOD are settings, not diagnostics.
+            .filter(|k| k.starts_with("T5_") && !matches!(k.as_str(), "T5_DISC" | "T5_MEMCARD" | "T5_MOD"))
             .collect()
     });
     !set.is_empty() && set.iter().any(|k| k == var)

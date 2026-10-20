@@ -18,6 +18,7 @@
 //!   +0x20 cid, +0x24 server, +0x28 buff, +0x2C cbuff}.
 
 pub mod cdvd;
+pub mod dbc;
 pub mod exec;
 pub mod hle;
 pub mod hw;
@@ -37,8 +38,10 @@ use std::collections::HashMap;
 pub const CMD_BUF: u32 = 0x0001_F000;
 pub const IOP_RAM: usize = 0x20_0000;
 const SERVER_BASE: u32 = 0x0001_E000;
-const BUFF_BASE: u32 = 0x001C_0000;
-const BUFF_SIZE: u32 = 0x4000;
+/// Receive buffers of the emulated RPC servers (16 × 8 KiB at the top of IOP RAM; the largest
+/// send seen is 4 KiB). Below it is the IOP heap (`exec::HEAP_END`).
+const BUFF_BASE: u32 = 0x001E_0000;
+const BUFF_SIZE: u32 = 0x2000;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Kind {
@@ -53,6 +56,7 @@ pub enum Kind {
     CdDiskReady2,
     Pad,
     PadExt,
+    Dbc,
     Mc,
     Sdr,
     Unknown,
@@ -79,11 +83,13 @@ pub struct Iop {
     pub cd: cdvd::Cd,
     pub misc: misc::Misc,
     pub pad: pad::Pads,
+    pub dbc: dbc::Dbc,
     pub mc: mc::Mc,
     pub scratch: Box<[u8]>,
     pub exec: exec::IopExec,
-    pub heap_next: u32,
     pub reboot_at: Option<u64>,
+    /// IOP memory the EE allocated over RPC (freed by an IOP reboot).
+    pub ee_heap: Vec<u32>,
     pub modules: Vec<String>,
 }
 
@@ -101,9 +107,10 @@ impl Iop {
             cd: cdvd::Cd::default(),
             misc: misc::Misc::default(),
             pad: pad::Pads::default(),
+            dbc: dbc::Dbc::default(),
             mc: mc::Mc::default(),
-            heap_next: 0x0010_0000,
             reboot_at: None,
+            ee_heap: Vec::new(),
             modules: Vec::new(),
         }
     }
@@ -152,6 +159,7 @@ fn kind_of(sid: u32) -> Kind {
         0x8000_059C => Kind::CdDiskReady2,
         0x8000_0100 => Kind::Pad,
         0x8000_0101 => Kind::PadExt,
+        s if dbc::SERVERS.contains(&s) => Kind::Dbc,
         0x8000_0400 => Kind::Mc,
         0x8000_0701 => Kind::Sdr,
         _ => Kind::Unknown,
@@ -227,6 +235,12 @@ pub fn command(m: &mut Machine, pkt: &[u8]) {
             let args = String::from_utf8_lossy(&pkt[0x18..(0x18 + n).min(pkt.len())]).trim_end_matches('\0').to_string();
             diag::log(format!("IOP reboot: {args}"));
             m.iop.modules.clear();
+            for a in std::mem::take(&mut m.iop.ee_heap) {
+                m.iop.exec.free(a);
+            }
+            // mcman restarts: the next GetInfo reports a new card again.
+            m.iop.mc.seen = [false; 2];
+            m.iop.dbc = dbc::Dbc::default();
             m.sif.queue.clear();
             m.sif.ee_pktbuf = 0;
             m.iop.reboot_at = Some(now + crate::EE_HZ / 10);
@@ -264,6 +278,7 @@ pub fn command(m: &mut Machine, pkt: &[u8]) {
 /// The IOP address of the server structure and buffer for `sid` (created on first bind). IOP RAM layout: HLE kernel 0..0x20000 (command buffer 0x1F000, server structures 0x1E000), modules 0x20000..0x100000, heap 0x100000..0x1C0000, HLE server buffers 0x1C0000.. (16 KiB each).
 fn server_for(m: &mut Machine, sid: u32) -> (u32, u32) {
     let n = m.iop.servers.len() as u32;
+    assert!(BUFF_BASE + BUFF_SIZE * (n + 1) <= IOP_RAM as u32, "IOP: too many emulated RPC servers");
     let s = m.iop.servers.entry(sid).or_insert_with(|| {
         let kind = kind_of(sid);
         diag::log(format!("IOP: bind RPC server {sid:#010x} ({kind:?})"));
@@ -336,6 +351,7 @@ fn rpc_call(m: &mut Machine, pkt: &[u8]) {
         }
         Kind::IopHeap | Kind::LoadFile => misc::heap_call(m, kind, fno, &data, recv_size),
         Kind::Pad | Kind::PadExt => pad::call(m, sid, &data, recv_size),
+        Kind::Dbc => dbc::call(m, sid, fno, &data, recv_size),
         Kind::Mc => mc::call(m, fno, &data, recv_size),
         Kind::Sdr => misc::sdr_call(m, fno, &data, recv_size),
         Kind::Unknown => {
@@ -381,6 +397,7 @@ pub fn update(m: &mut Machine, now: u64) {
     }
     misc::update(m, now);
     pad::update(m);
+    dbc::update(m);
     hw::update(m, now);
     exec::run(m);
 }

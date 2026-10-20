@@ -2,7 +2,8 @@
 //! displayed frame as a PNG every second and stops after the given time.
 //!
 //! Usage: t5-headless [seconds] [out_dir] [--press BUTTON@SECOND ...]
-//! (BUTTON: START, CROSS, CIRCLE, UP, DOWN, LEFT, RIGHT; held for half a second.)
+//! (BUTTON: START, CROSS, CIRCLE, SQUARE, TRIANGLE, UP, DOWN, LEFT, RIGHT; held for half a second.)
+//! Seconds are device time: `T5_WARP=1` (or ranges, `ps2_runtime::warp_on`) skips idle time.
 
 use std::sync::atomic::Ordering::Relaxed;
 
@@ -13,27 +14,6 @@ fn main() {
     let secs: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(30);
     let out = args.get(2).cloned().unwrap_or_else(|| "headless".into());
     let _ = std::fs::create_dir_all(&out);
-    let mut presses: Vec<(u16, f64)> = Vec::new();
-    for w in args.windows(2).filter(|w| w[0] == "--press") {
-        if let Some((b, t)) = w[1].split_once('@') {
-            let bit = match b {
-                "START" => ps2_runtime::pad::START,
-                "CROSS" => ps2_runtime::pad::CROSS,
-                "CIRCLE" => ps2_runtime::pad::CIRCLE,
-                "SQUARE" => ps2_runtime::pad::SQUARE,
-                "TRIANGLE" => ps2_runtime::pad::TRIANGLE,
-                "UP" => ps2_runtime::pad::UP,
-                "DOWN" => ps2_runtime::pad::DOWN,
-                "LEFT" => ps2_runtime::pad::LEFT,
-                "RIGHT" => ps2_runtime::pad::RIGHT,
-                _ => 0,
-            };
-            presses.push((bit, t.parse().unwrap_or(0.0)));
-        }
-    }
-    // T5_PRESS_HOLD=<seconds>: how long each --press holds its button (default 0.5; menus
-    // auto-repeat when held longer than ~0.2 s)
-    let hold: f64 = std::env::var("T5_PRESS_HOLD").ok().and_then(|v| v.parse().ok()).unwrap_or(0.5);
     let shared = t5_recomp::boot();
     std::thread::Builder::new()
         .name("ps2-ee".into())
@@ -44,19 +24,18 @@ fn main() {
             t5_recomp::run()
         })
         .expect("spawn guest thread");
-    let t0 = std::time::Instant::now();
+    t5_recomp::script::init(&args);
     let pad = shared.pad.clone();
     std::thread::spawn(move || loop {
-        let t = t0.elapsed().as_secs_f64();
-        let held = presses.iter().filter(|(_, at)| t >= *at && t < at + hold).fold(0u16, |a, (b, _)| a | b);
-        pad.buttons[0].store(held, std::sync::atomic::Ordering::Relaxed);
+        pad.buttons[0].store(t5_recomp::script::held(), std::sync::atomic::Ordering::Relaxed);
         std::thread::sleep(std::time::Duration::from_millis(10));
     });
-    // T5_PROFILE=<start>: sample the guest thread from that second to the end.
+    // T5_PROFILE=<start>: sample the guest thread from that second to the end (Windows only).
+    #[cfg(windows)]
     let prof = std::env::var("T5_PROFILE").ok().and_then(|v| v.parse::<u64>().ok()).map(|start| {
         let span = secs.saturating_sub(start).max(1);
         std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_secs(start));
+            wait_secs(start as f64);
             t5_recomp::profile::run(span)
         })
     });
@@ -66,13 +45,13 @@ fn main() {
         let frames = shared.frames.clone();
         let out = out.clone();
         std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_secs(start));
+            wait_secs(start as f64);
             let mut seen = 0;
             let mut buf = ps2_runtime::gs::Frame::default();
-            let end = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            let end = start as f64 + 1.0;
             let mut i = 0;
             let mut kept = Vec::new();
-            while std::time::Instant::now() < end {
+            while ps2_runtime::secs() < end {
                 let n = frames.take_if_new(seen, &mut buf);
                 if n != seen {
                     seen = n;
@@ -91,7 +70,7 @@ fn main() {
     // players' current move pointer (player struct 0x3A88D0[p] + 0xC0) with the vblank count.
     if let Some(start) = std::env::var("T5_MOVELOG").ok().and_then(|v| v.parse::<u64>().ok()) {
         std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_secs(start));
+            wait_secs(start as f64);
             let ram = &ps2_runtime::machine().ram;
             let rd = |a: usize| u32::from_le_bytes([ram[a], ram[a + 1], ram[a + 2], ram[a + 3]]);
             let mut last = [0u32; 2];
@@ -112,7 +91,7 @@ fn main() {
         });
     }
     for s in 1..=secs {
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        wait_secs(s as f64);
         // T5_RAMSNAP=<s1>,<s2>,...: EE RAM dumps at those seconds (finding game variables).
         if let Ok(v) = std::env::var("T5_RAMSNAP") {
             if v.split(',').any(|x| x.trim().parse::<u64>().ok() == Some(s)) {
@@ -135,10 +114,19 @@ fn main() {
             ps2_runtime::UNKNOWN_TARGETS.load(Relaxed)
         );
     }
+    #[cfg(windows)]
     if let Some(p) = prof {
         if let Ok(h) = p.join() {
             t5_recomp::profile::report(h);
         }
     }
     std::process::exit(0);
+}
+
+/// Sleep until the device clock reaches `t` seconds (all times here are device time, so a run
+/// under `T5_WARP` does the same at the same game moments, only sooner).
+fn wait_secs(t: f64) {
+    while ps2_runtime::secs() < t {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
 }

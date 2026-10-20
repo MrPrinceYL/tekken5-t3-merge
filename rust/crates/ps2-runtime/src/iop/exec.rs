@@ -182,8 +182,7 @@ pub struct IopExec {
     pub rpc_busy: std::collections::HashSet<u32>,
 }
 
-pub const HEAP_START: u32 = 0x0010_0000;
-pub const HEAP_END: u32 = 0x001C_0000;
+pub const HEAP_END: u32 = 0x001E_0000;
 
 impl IopExec {
     pub fn new(table: &'static [IopModule], ram: *mut u8, scratch: *mut u8) -> IopExec {
@@ -226,8 +225,20 @@ impl IopExec {
 
     // ---- memory ----
 
+    /// Start of the IOP heap: right after the recompiled modules' slots (64 KiB each, see
+    /// tools/iop_modules.py), as on the IOP where free memory begins after the loaded modules.
+    /// Modules of the upper area (0x100000.., the Arcade History titles') count only once
+    /// loaded, so the main game's heap does not depend on them.
+    fn heap_start(&self) -> u32 {
+        let end = |m: &IopModule| (m.base + m.size + 0xFFFF) & !0xFFFF;
+        let lower = self.table.iter().filter(|m| m.base < 0x0010_0000).map(end).max().unwrap_or(0);
+        let loaded = self.loaded.iter().map(|m| end(m)).max().unwrap_or(0);
+        lower.max(loaded).max(0x0002_0000)
+    }
+
     /// AllocSysMemory: 0 = lowest fit, 1 = highest fit, 2 = at `at`.
     pub fn alloc(&mut self, mode: u32, size: u32, at: u32) -> u32 {
+        let heap_start = self.heap_start();
         let size = (size + 255) & !255;
         if size == 0 {
             return 0;
@@ -236,12 +247,12 @@ impl IopExec {
         let fits = |s: u32, heap: &Vec<(u32, u32)>| heap.iter().all(|&(a, n)| s + size <= a || s >= a + n);
         let a = if mode == 2 {
             let a = at & !255;
-            if a < HEAP_START || a + size > HEAP_END || !fits(a, &self.heap) {
+            if a < heap_start || a + size > HEAP_END || !fits(a, &self.heap) {
                 return 0;
             }
             a
         } else {
-            let mut cands = vec![HEAP_START];
+            let mut cands = vec![heap_start];
             cands.extend(self.heap.iter().map(|&(a, n)| (a + n + 255) & !255));
             if mode == 1 {
                 cands.extend(self.heap.iter().map(|&(a, _)| a.saturating_sub(size) & !255));
@@ -249,7 +260,7 @@ impl IopExec {
                 cands.sort();
                 cands.reverse();
             }
-            match cands.into_iter().find(|&s| s >= HEAP_START && s + size <= HEAP_END && fits(s, &self.heap)) {
+            match cands.into_iter().find(|&s| s >= heap_start && s + size <= HEAP_END && fits(s, &self.heap)) {
                 Some(s) => s,
                 None => return 0,
             }
@@ -265,9 +276,10 @@ impl IopExec {
     }
 
     pub fn max_free(&mut self) -> u32 {
+        let heap_start = self.heap_start();
         self.heap.sort();
         let mut best = 0;
-        let mut cur = HEAP_START;
+        let mut cur = heap_start;
         for &(a, n) in &self.heap {
             best = best.max(a.saturating_sub(cur));
             cur = cur.max(a + n);
@@ -276,7 +288,8 @@ impl IopExec {
     }
 
     pub fn total_free(&self) -> u32 {
-        (HEAP_END - HEAP_START) - self.heap.iter().map(|x| x.1).sum::<u32>()
+        let heap_start = self.heap_start();
+        (HEAP_END - heap_start) - self.heap.iter().map(|x| x.1).sum::<u32>()
     }
 
     fn lookup(&self, addr: u32) -> Option<fn(&mut Ctx, u32)> {
@@ -695,6 +708,9 @@ pub fn load(m: &mut Machine, addr: u32, name: &str) -> Option<i32> {
     let table = m.iop.exec.table;
     let Some(md) = table.iter().find(|x| x.sha1 == sha) else {
         diag::log(format!("IOP: module {name} (sha1 {sha}) is not recompiled: emulated"));
+        if diag::enabled("T5_DUMPUNK") {
+            let _ = std::fs::write(format!("irx_{sha}.bin"), m.iop.read(addr, 0x40000));
+        }
         return None;
     };
     if m.iop.exec.loaded.iter().any(|x| x.sha1 == md.sha1) {

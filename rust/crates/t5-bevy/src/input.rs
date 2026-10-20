@@ -32,7 +32,21 @@ use std::sync::Arc;
 pub const CONTROLS: &[&str] = &[
     "Cross", "Circle", "Square", "Triangle", "L1", "R1", "L2", "R2", "Start", "Select", "L3", "R3",
     "D-Pad Up", "D-Pad Down", "D-Pad Left", "D-Pad Right",
+    "Left Stick Up", "Left Stick Down", "Left Stick Left", "Left Stick Right",
+    "Right Stick Up", "Right Stick Down", "Right Stick Left", "Right Stick Right",
 ];
+
+/// The analog sticks (DualShock 2): (negative, positive) control per axis, in the order of the
+/// controller's bytes RX, RY, LX, LY (Y: up negative, as the PS2 reports it).
+const STICKS: [(&str, &str); 4] = [
+    ("Right Stick Left", "Right Stick Right"),
+    ("Right Stick Up", "Right Stick Down"),
+    ("Left Stick Left", "Left Stick Right"),
+    ("Left Stick Up", "Left Stick Down"),
+];
+
+/// Current version of controls.json (2: sticks are analog, no longer D-pad buttons).
+const CONTROLS_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
@@ -64,14 +78,22 @@ impl Default for Controls {
             ("Select", b(&["Key:ShiftRight", "Key:Tab", "Pad:Select"])),
             ("L3", b(&["Pad:LeftThumb"])),
             ("R3", b(&["Pad:RightThumb"])),
-            ("D-Pad Up", b(&["Key:ArrowUp", "Key:KeyW", "Pad:DPadUp", "Axis:LeftStickY+"])),
-            ("D-Pad Down", b(&["Key:ArrowDown", "Key:KeyS", "Pad:DPadDown", "Axis:LeftStickY-"])),
-            ("D-Pad Left", b(&["Key:ArrowLeft", "Key:KeyA", "Pad:DPadLeft", "Axis:LeftStickX-"])),
-            ("D-Pad Right", b(&["Key:ArrowRight", "Key:KeyD", "Pad:DPadRight", "Axis:LeftStickX+"])),
+            ("D-Pad Up", b(&["Key:ArrowUp", "Key:KeyW", "Pad:DPadUp"])),
+            ("D-Pad Down", b(&["Key:ArrowDown", "Key:KeyS", "Pad:DPadDown"])),
+            ("D-Pad Left", b(&["Key:ArrowLeft", "Key:KeyA", "Pad:DPadLeft"])),
+            ("D-Pad Right", b(&["Key:ArrowRight", "Key:KeyD", "Pad:DPadRight"])),
+            ("Left Stick Up", b(&["Axis:LeftStickY+"])),
+            ("Left Stick Down", b(&["Axis:LeftStickY-"])),
+            ("Left Stick Left", b(&["Axis:LeftStickX-"])),
+            ("Left Stick Right", b(&["Axis:LeftStickX+"])),
+            ("Right Stick Up", b(&["Axis:RightStickY+", "Key:KeyI"])),
+            ("Right Stick Down", b(&["Axis:RightStickY-", "Key:KeyK"])),
+            ("Right Stick Left", b(&["Axis:RightStickX-", "Key:KeyJ"])),
+            ("Right Stick Right", b(&["Axis:RightStickX+", "Key:KeyL"])),
         ] {
             m.insert(k.to_string(), v);
         }
-        Controls { version: 1, deadzone: 0.35, mouse_sensitivity: 0.02, mouse_return: 0.15, bindings: m }
+        Controls { version: CONTROLS_VERSION, deadzone: 0.35, mouse_sensitivity: 0.02, mouse_return: 0.15, bindings: m }
     }
 }
 
@@ -95,6 +117,16 @@ impl Controls {
         if let Ok(text) = std::fs::read_to_string(&path) {
             match serde_json::from_str::<Controls>(&text) {
                 Ok(mut c) => {
+                    // Version 1 drove the D-pad with the left stick: the stick is analog now.
+                    if c.version < 2 {
+                        for (k, v) in c.bindings.iter_mut() {
+                            if k.starts_with("D-Pad") {
+                                v.retain(|s| !s.starts_with("Axis:LeftStick"));
+                            }
+                        }
+                        c.version = CONTROLS_VERSION;
+                        c.save();
+                    }
                     // Controls added in later versions get their defaults.
                     for (k, v) in Controls::default().bindings {
                         c.bindings.entry(k).or_insert(v);
@@ -390,6 +422,21 @@ impl Devices<'_> {
                 .fold(0.0, f32::max),
         }
     }
+
+    /// 0..1 deflection of one source for an analog stick: a small deadzone only (released
+    /// sticks must read exactly centred), rescaled to the full range.
+    fn analog(&self, s: &Source) -> f32 {
+        const DEAD: f32 = 0.12;
+        match *s {
+            Source::Axis(a, sign) => self
+                .pads
+                .iter()
+                .map(|&(e, g)| (self.origins.adjust(e, &name(&a), g.axis(a).unwrap_or(0.0)) * sign).clamp(0.0, 1.0))
+                .map(|v| if v < DEAD { 0.0 } else { (v - DEAD) / (1.0 - DEAD) })
+                .fold(0.0, f32::max),
+            _ => self.value(s),
+        }
+    }
 }
 
 const BITS: &[(&str, u16)] = &[
@@ -417,6 +464,18 @@ impl Input {
             b &= !(pad::UP | pad::DOWN);
         }
         b
+    }
+
+    /// The analog sticks as the controller's RX, RY, LX, LY bytes (0x80 = centre).
+    fn sticks(&self, dev: &Devices) -> u32 {
+        let level = |n: &str| self.parsed.iter().find(|(c, _)| c == n).map_or(0.0, |(_, l)| l.iter().map(|s| dev.analog(s)).fold(0.0, f32::max));
+        let mut out = 0u32;
+        for (i, (neg, pos)) in STICKS.iter().enumerate() {
+            let v = (level(pos) - level(neg)).clamp(-1.0, 1.0);
+            let byte = (128.0 + v * 127.5).round().clamp(0.0, 255.0) as u32;
+            out |= byte << (8 * i);
+        }
+        out
     }
 }
 
@@ -449,6 +508,8 @@ pub fn read_input(
     if input.menu_open || crate::settings::MENU_OPEN.load(std::sync::atomic::Ordering::Relaxed) {
         input.pad.set(0, 0, true);
         input.pad.set(1, 0, input.active.len() >= 2);
+        input.pad.set_sticks(0, 0);
+        input.pad.set_sticks(1, 0);
         return;
     }
     let mut order: Vec<(PadId, PadRef)> = all.iter().copied().filter(|(id, _)| input.active.contains_key(id)).collect();
@@ -459,14 +520,18 @@ pub fn read_input(
     let two = pads.len() >= 2 && input.active.len() >= 2;
     let p1_pads: Vec<(PadId, PadRef)> = if two { pads[..1].to_vec() } else { pads.clone() };
     let dev1 = Devices { keys: &keys, mouse: &mouse, pads: p1_pads, origins: &input.origins, mouse_stick: ms, deadzone: c.deadzone };
-    let b1 = input.buttons(&dev1);
+    // Scripted presses of a measurement run (`--press`, t5_recomp::script).
+    let b1 = input.buttons(&dev1) | t5_recomp::script::held();
     input.pad.set(0, b1, true);
+    input.pad.set_sticks(0, input.sticks(&dev1));
     if two {
         let dev2 = Devices { keys: &none, mouse: &none_m, pads: pads[1..2].to_vec(), origins: &input.origins, mouse_stick: Vec2::ZERO, deadzone: c.deadzone };
         let b2 = input.buttons(&dev2);
         input.pad.set(1, b2, true);
+        input.pad.set_sticks(1, input.sticks(&dev2));
     } else {
         input.pad.set(1, 0, false);
+        input.pad.set_sticks(1, 0);
     }
 }
 

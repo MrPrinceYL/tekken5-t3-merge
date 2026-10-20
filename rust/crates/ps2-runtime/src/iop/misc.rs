@@ -19,20 +19,38 @@ fn word(recv: usize, v: u32) -> Vec<u8> {
 pub fn heap_call(m: &mut Machine, kind: Kind, fno: u32, d: &[u8], recv: usize) -> Reply {
     match (kind, fno) {
         (Kind::IopHeap, 1) => {
-            // sceSifAllocIopHeap(size)
-            let size = (le(d, 0) + 63) & !63;
-            let a = m.iop.heap_next;
-            m.iop.heap_next = (a + size).min(0x001C_0000);
+            // sceSifAllocIopHeap(size): AllocSysMemory(lowest fit) on the IOP (the same heap the
+            // recompiled modules allocate from), 0 if it does not fit.
+            let a = m.iop.exec.alloc(0, le(d, 0), 0);
+            diag::log(format!("IOP heap: alloc {:#x} -> {a:#x} (max free {:#x})", le(d, 0), m.iop.exec.max_free()));
+            if a != 0 {
+                m.iop.ee_heap.push(a);
+            }
             Reply::Now(word(recv, a))
         }
-        (Kind::IopHeap, 2) => Reply::Now(word(recv, 0)),
+        (Kind::IopHeap, 2) => {
+            // sceSifFreeIopHeap(addr): 0, or -1 if it was not allocated.
+            let a = le(d, 0);
+            m.iop.ee_heap.retain(|&x| x != a);
+            diag::log(format!("IOP heap: free {a:#x}"));
+            let ok = m.iop.exec.free(a);
+            Reply::Now(word(recv, if ok { 0 } else { u32::MAX }))
+        }
         (Kind::IopHeap, 4) => {
-            // AllocSysMemory(type, size, address): type 2 = at the address.
-            let (size, at) = (le(d, 0), le(d, 8));
-            let a = if le(d, 4) == 2 { at } else { let a = m.iop.heap_next; m.iop.heap_next += (size + 255) & !255; a };
+            // AllocSysMemory(type, size, address): 0 lowest, 1 highest, 2 at the address.
+            let a = m.iop.exec.alloc(le(d, 4), le(d, 0), le(d, 8));
+            diag::log(format!("IOP heap: AllocSysMemory({}, {:#x}, {:#x}) -> {a:#x}", le(d, 4), le(d, 0), le(d, 8)));
+            if a != 0 {
+                m.iop.ee_heap.push(a);
+            }
             Reply::Now(word(recv, a))
         }
-        (Kind::IopHeap, 5) | (Kind::IopHeap, 6) => Reply::Now(word(recv, 0x0018_0000 - m.iop.heap_next)),
+        (Kind::IopHeap, 5) => {
+            let f = m.iop.exec.max_free();
+            diag::log(format!("IOP heap: QueryMaxFreeMemSize -> {f:#x}"));
+            Reply::Now(word(recv, f))
+        }
+        (Kind::IopHeap, 6) => Reply::Now(word(recv, m.iop.exec.total_free())),
         (Kind::LoadFile, 0xFF) => {
             // Version tag checked by libkernl (SLUS 0x00117A68).
             let mut r = vec![0u8; recv.max(4)];

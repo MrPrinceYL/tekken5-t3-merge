@@ -269,27 +269,33 @@ pub struct FpsWindow {
     start: Option<std::time::Instant>,
     game0: u64,
     flips0: u64,
+    logic0: u64,
     text: String,
 }
 
 /// `game_frames`: frames sent to the screen (the console's ~60 Hz video rate); `flips`: frames
 /// the game itself finished (display-buffer flips), i.e. how fast the game is actually running.
-pub fn update_fps(game_frames: u64, flips: u64, settings: &Settings, w: &mut FpsWindow, q: &mut Query<(&mut Text, &mut Visibility), With<FpsText>>) {
+/// `game_frames`: pictures the game actually rendered (copy passes from a newly drawn frame);
+/// `logic`: the game's logic frame counter (fights only; 0 elsewhere).
+pub fn update_fps(game_frames: u64, logic: u64, flips: u64, settings: &Settings, w: &mut FpsWindow, q: &mut Query<(&mut Text, &mut Visibility), With<FpsText>>) {
     let Ok((mut t, mut vis)) = q.single_mut() else { return };
     *vis = if settings.show_fps { Visibility::Visible } else { Visibility::Hidden };
     let now = std::time::Instant::now();
     let start = *w.start.get_or_insert_with(|| {
         w.game0 = game_frames;
         w.flips0 = flips;
+        w.logic0 = logic;
         now
     });
     let dt = now.duration_since(start).as_secs_f64();
     if dt >= 0.5 {
         let video = game_frames.saturating_sub(w.game0) as f64 / dt;
-        w.text = format!("{video:.0} FPS");
+        let lg = logic.saturating_sub(w.logic0) as f64 / dt;
+        w.text = if lg > 0.5 { format!("{video:.0} FPS (Logik {lg:.0})") } else { format!("{video:.0} FPS") };
         w.start = Some(now);
         w.game0 = game_frames;
         w.flips0 = flips;
+        w.logic0 = logic;
     }
     if settings.show_fps && t.0 != w.text {
         t.0 = w.text.clone();
