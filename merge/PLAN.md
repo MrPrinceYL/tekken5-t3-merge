@@ -47,8 +47,15 @@ fehlerfrei in T5. Jede Stufe erst im Spiel prüfen (headless + Bild), dann notie
       clones/states): Ogre 56→122/151, Gun Jack 92→129/213, Gon 55→73/150, Dr. B 81→125/243.
       Moveset-Aufteilung per ram.csv (Tabelle[1]=0x6D580, [2]=0x77C00): alle außer King bis
       447872 Byte (Ogre jetzt 412732). Fenstertest mit Zufallseingaben: alle fünf stabil.
-      Rest (Gründe laut coverage.py): Seitenvarianten req 36/38 bei den neuen Einträgen (nur der
-      alte Vorlagen-Weg kennt sie), tastenlose Übergänge zu Angriffen (Gon 34!), Bedingungen
+      Danach (21.10.): automatische T3-Übergänge (Befehl 0x10 = nur Flag → T5-Befehl 0 im
+      Zeitfenster, mehrteilige Moves) und T3-„next“ am Animationsende (außer Stand/Ruheschleifen)
+      in `clone()`; Seitenvarianten (REQ_T3_T5, T5-Listen mit genau einer Bedingung aus der
+      Vorlage) in den Zustandseinträgen; gemeinsame T5-Animationen nur noch bei >5 % Größen-
+      abweichung kopiert (Ogre/True Ogre nicht → Bank 1,3 MB). Abdeckung: Ogre 133/151, Gun Jack
+      141/213, Gon 90/150, Dr. B 148/243. Zufallseingaben-Test: alle fünf stabil, 300 LOGIC/5 s.
+      Rest: Moves hinter nicht gepaarten Zuständen (from_unported: Dr. B 53, Gun Jack 33, Gon
+      26 – z. B. T3-Liegeschleifen mit Bodenangriffen: Gun Jack 35/36, Gon 114/169, Dr. B 274;
+      Gon 101 nach Sprung), tastenlose Übergänge mit Richtung (Gon 25), Bedingungen
       (cond 17/90/84/15/4/30 – vermutlich True-Ogre-Feueratem u. Ä.: Ogre/True Ogre haben auf
       der Disc ein byte-identisches T3-Paket (TOC 186/190/202/206)), Bewegungseingaben
       (Gun Jack 0xC016–0xC01C), Moves nur über nicht gepaarte Zustände erreichbar (from_unported).

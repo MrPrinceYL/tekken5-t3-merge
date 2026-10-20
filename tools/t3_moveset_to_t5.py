@@ -98,12 +98,12 @@ def t3_attacks(ms, state=0):
 
 def t3_attack_entries(ms, state):
     """Every attack entry of a T3 move's cancel list in T3 order: (key, T3 move, damage, frame
-    from, frame to, start frame). Unlike t3_attacks the same command can occur several times
-    (e.g. jump attacks rising / falling by frame window)."""
+    from, frame to, start frame, T5 requirement condition or 0). Unlike t3_attacks the same
+    command can occur several times (e.g. jump attacks rising / falling by frame window)."""
     out = []
     for _, e in ms.cancels(ms.own, ms.own.move(state)[3]):
         cmd, cond, req, _, tgt, _, fr0, fr1, st = e
-        if cmd >= 0xC000 or cond not in FREE or req or not cmd & 0xF:
+        if cmd >= 0xC000 or cond not in FREE or (req and req not in REQ_T3_T5) or not cmd & 0xF:
             continue
         pk, idx = ms.resolve(tgt)
         if pk is not ms.own or idx >= pk.count:
@@ -111,7 +111,7 @@ def t3_attack_entries(ms, state):
         dmg = pk.move(idx)[5] & 0xFFFF
         if not pk.move_bytes(idx)[0x2D] or dmg & 0x4000:
             continue
-        out.append((t5_key(cmd), idx, dmg, max(fr0, 1), fr1, max(st, 1)))
+        out.append((t5_key(cmd), idx, dmg, max(fr0, 1), fr1, max(st, 1), REQ_T3_T5.get(req, 0)))
     return out
 
 
@@ -210,6 +210,8 @@ def scale_to_body(m, costume, template_slot, com, anims, n_tpl, t3_anim):
     for i, a in enumerate(anims):
         s = 1.0 if 0x4000 + i in victim else tpl_scale if i < n_tpl else size / 100 if i in own else 1.0
         out.append(scale_floats(a, s) if a and abs(s - 1) > 1e-3 else a)
+    if abs(tpl_scale - 1) <= 0.05:                    # Ogre x1.04, True Ogre x0.99: the
+        return out                                    # common animations fit as they are
     common = t5_bank_anims(COMMON_BANK.read_bytes())
     copied = {}
     for i in range(n):
@@ -308,6 +310,14 @@ def build(m, costume, out_dir, template_slot=0):
 
     tmpl_of = {}                                      # T5 key -> template attack move
 
+    def own_move(tgt):
+        """(own T3 move, damage word) of a cancel / next target, attack or not; None for the
+        common pack."""
+        pk, idx = ms.resolve(tgt)
+        if pk is not ms.own or idx >= pk.count:
+            return None
+        return idx, pk.move(idx)[5] & 0xFFFF
+
     def t3_attack(tgt):
         """(own T3 move, damage) of a cancel target if it is a plain attack, else None."""
         pk, idx = ms.resolve(tgt)
@@ -365,7 +375,16 @@ def build(m, costume, out_dir, template_slot=0):
         entries = []
         for _, e in ms.cancels(ms.own, ms.own.move(t3idx)[3]):
             cmd, cond, req, _, tgt, _, fr0, fr1, st = e
-            if cmd >= 0xC000 or cond not in FREE or req or not cmd & 0xF:
+            if cmd >= 0xC000 or cond not in FREE or req:
+                continue
+            if cmd == 0x10:
+                # automatic continuation in a frame window (multi-part moves): T5 command 0
+                a = own_move(tgt)
+                if a is not None:
+                    entries.append(struct.pack(CANCEL, 0, 0, clone(tmove, *a), 0,
+                                               max(fr0, 1), fr1, max(st, 1), 0))
+                continue
+            if not cmd & 0xF:
                 continue
             a = t3_attack(tgt)
             if a is None:
@@ -374,11 +393,22 @@ def build(m, costume, out_dir, template_slot=0):
             child = clone(tmpl_of.get(k, tmove), *a)
             entries.append(struct.pack(CANCEL, k[0] | k[1] << 16 | 0x20 << 24, 0, child, 9,
                                        fr0, fr1, st, 0))
+        # T3's follow-up at the end of the animation, unless it is standing or a resting loop
+        # (those stay the template's: the T5 state machine's own way back)
+        nxt = own_move(struct.unpack_from("<H", b, 0x10)[0])
+        follow = None
+        if nxt is not None and nxt[0] > 1:
+            nb = ms.own.move_bytes(nxt[0])
+            if own_move(struct.unpack_from("<H", nb, 0x10)[0]) != nxt:
+                follow = clone(tmove, *nxt)
         length = ms.own.anim_frames(t3idx, ms.common)
         for e in com.lists["cancel"][mv["cancel"]:]:
             f = list(struct.unpack(CANCEL, e))
             if f[0] == 0x8000:
                 f[4] = f[6] = length
+                if follow is not None:
+                    f[2] = follow
+                    mv["transition"] = follow
                 entries.append(struct.pack(CANCEL, *f))
                 break
             if not (f[0] >> 16) & 0xFF:
@@ -455,6 +485,12 @@ def build(m, costume, out_dir, template_slot=0):
 
     pairs = {stand: 0}
     n_added = 0
+    # requirement lists of the template that hold exactly one condition (T5 side conditions)
+    R = [struct.unpack("<HH", e) for e in com.lists["requirement"]]
+    req_list = {}
+    for k in range(len(R) - 1):
+        if R[k + 1][0] == REQ_END and (k == 0 or R[k - 1][0] == REQ_END) and R[k][1] == 0:
+            req_list.setdefault(R[k][0], k)
     queue = [stand]
     n_states = 0
     while queue:
@@ -482,11 +518,13 @@ def build(m, costume, out_dir, template_slot=0):
             entries.append(struct.pack(CANCEL, *f))
         # the T3 state's attacks, all of them in T3 order with T3's frame windows, in front
         front = []
-        for key, t3idx, dmg, fr0, fr1, st in t3_attack_entries(ms, st3):
+        for key, t3idx, dmg, fr0, fr1, st, rq in t3_attack_entries(ms, st3):
+            if rq and rq not in req_list:
+                continue
             tm = tmpl_of.get(key) or next((v for k, v in tmpl_of.items() if k[1] == key[1]),
                                           next(iter(tmpl_of.values())))
             ref = sample or [0, 0, 0, 0, 1, 255, 1, 0]
-            front.append(struct.pack(CANCEL, key[0] | key[1] << 16, 0, clone(tm, t3idx, dmg),
+            front.append(struct.pack(CANCEL, key[0] | key[1] << 16, req_list.get(rq, 0), clone(tm, t3idx, dmg),
                                      ref[3], fr0, fr1, st, ref[7]))
             n_added += 1
         entries = front + entries
