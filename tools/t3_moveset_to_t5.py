@@ -44,6 +44,10 @@ REQ_END = 0x141                                        # T5 requirement list end
 # T3 cancel conditions that mean "always": 0, and 107 (all 90 cond-107 standing entries of the 15
 # characters in both games have an unconditional T5 counterpart; used on 1+2, 3+4, d/f+1+2 ...)
 FREE = (0, 107)
+# learned by tools/t3_req_learn.py (21.10.): T3 conditions / requirements whose aligned T5 entries
+# have no requirement (cond 1/2/3/4/6/8/10/18: 19..80 samples each; req 39, 57: 28 / 13 samples)
+FREE_ATTACK = FREE + (1, 2, 3, 4, 6, 8, 10, 18)
+REQ_NONE = (0, 39, 57)
 LEVEL = {1: 1, 2: 2, 3: 4, 4: 5, 6: 7}                # T3 hit level byte -> T5 (T5 has a 3)
 
 
@@ -103,7 +107,8 @@ def t3_attack_entries(ms, state):
     out = []
     for _, e in ms.cancels(ms.own, ms.own.move(state)[3]):
         cmd, cond, req, _, tgt, _, fr0, fr1, st = e
-        if cmd >= 0xC000 or cond not in FREE or (req and req not in REQ_T3_T5) or not cmd & 0xF:
+        if (cmd >= 0xC000 or cond not in FREE_ATTACK or (req not in REQ_NONE and req not in REQ_T3_T5)
+                or not cmd & 0xF):
             continue
         pk, idx = ms.resolve(tgt)
         if pk is not ms.own or idx >= pk.count:
@@ -210,8 +215,11 @@ def scale_to_body(m, costume, template_slot, com, anims, n_tpl, t3_anim):
     for i, a in enumerate(anims):
         s = 1.0 if 0x4000 + i in victim else tpl_scale if i < n_tpl else size / 100 if i in own else 1.0
         out.append(scale_floats(a, s) if a and abs(s - 1) > 1e-3 else a)
-    if abs(tpl_scale - 1) <= 0.05:                    # Ogre x1.04, True Ogre x0.99: the
-        return out                                    # common animations fit as they are
+    # only Gon (x0.43) needs scaled copies of the common T5 animations (reactions, getting up);
+    # Ogre x1.04, True Ogre x0.99, Gun Jack x0.875, Dr. B x0.86 use them as they are: the copies
+    # cost ~0.8 MB of bank, which the T3 moves need
+    if abs(tpl_scale - 1) <= 0.15:
+        return out
     common = t5_bank_anims(COMMON_BANK.read_bytes())
     copied = {}
     for i in range(n):
@@ -310,6 +318,19 @@ def build(m, costume, out_dir, template_slot=0):
 
     tmpl_of = {}                                      # T5 key -> template attack move
 
+    def resting(i):
+        """A T3 loop (its follow-up is itself): standing, crouching, lying."""
+        nxt = own_move(struct.unpack_from("<H", ms.own.move_bytes(i), 0x10)[0])
+        return nxt is not None and nxt[0] == i
+
+    tmpl_names = {com.name(com.move(i)["name"]): i for i in range(len(com.lists["move"]))}
+
+    def lying_template(i):
+        """T5 lying loop (face up, with its get-up options) for a T3 lying loop, else None."""
+        if resting(i) and ms.own.move(i)[1] & 0xFFFF in (0x3884, 0x4284):
+            return tmpl_names.get("dwKAM_00U")
+        return None
+
     def own_move(tgt):
         """(own T3 move, damage word) of a cancel / next target, attack or not; None for the
         common pack."""
@@ -364,7 +385,9 @@ def build(m, costume, out_dir, template_slot=0):
             mv["anim"] = a
         mv["active_start"], mv["active_end"] = b[0x2D], b[0x2E]
         w = ms.own.move(t3idx)
-        mv["vuln"], mv["hitlevel"] = w[1], t5_hitlevel(w[2])
+        # T3 lying (0x3884 face up, 0x4284 face down) has no T5 equivalent value: the template's
+        mv["vuln"] = mv["vuln"] if w[1] & 0xFFFF in (0x3884, 0x4284) else w[1]
+        mv["hitlevel"] = t5_hitlevel(w[2])
         if mv["hitcond"] < len(com.lists["hitcond"]):
             mv["hitcond"] = copy_hitconds(mv["hitcond"], dmg, t3_reaction(ms, t3idx))
         new = com.add("move", com.pack_move(mv))     # reserved first: strings can loop
@@ -375,7 +398,7 @@ def build(m, costume, out_dir, template_slot=0):
         entries = []
         for _, e in ms.cancels(ms.own, ms.own.move(t3idx)[3]):
             cmd, cond, req, _, tgt, _, fr0, fr1, st = e
-            if cmd >= 0xC000 or cond not in FREE or req:
+            if cmd >= 0xC000 or cond not in FREE_ATTACK or req not in REQ_NONE:
                 continue
             if cmd == 0x10:
                 # automatic continuation in a frame window (multi-part moves): T5 command 0
@@ -385,6 +408,14 @@ def build(m, costume, out_dir, template_slot=0):
                                                max(fr0, 1), fr1, max(st, 1), 0))
                 continue
             if not cmd & 0xF:
+                # direction only (held): landings, rolls, stance changes inside a move
+                a = own_move(tgt)
+                if a is not None and a[0] > 1:
+                    lie = lying_template(a[0])
+                    if lie is not None or not resting(a[0]):
+                        entries.append(struct.pack(CANCEL, t5_key(cmd)[0], 0,
+                                                   clone(lie if lie is not None else tmove, *a),
+                                                   0, max(fr0, 1), fr1, max(st, 1), 0))
                 continue
             a = t3_attack(tgt)
             if a is None:

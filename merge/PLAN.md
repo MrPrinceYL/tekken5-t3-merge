@@ -53,6 +53,17 @@ fehlerfrei in T5. Jede Stufe erst im Spiel prüfen (headless + Bild), dann notie
       Vorlage) in den Zustandseinträgen; gemeinsame T5-Animationen nur noch bei >5 % Größen-
       abweichung kopiert (Ogre/True Ogre nicht → Bank 1,3 MB). Abdeckung: Ogre 133/151, Gun Jack
       141/213, Gon 90/150, Dr. B 148/243. Zufallseingaben-Test: alle fünf stabil, 300 LOGIC/5 s.
+      Weiter (21.10.): Richtungs-Übergänge ohne Taste in `clone()` (Landungen, Rollen), T3-
+      Liegeschleifen (vuln 0x3884/0x4284) mit Vorlage `dwKAM_00U` (T5-Aufstehen), T3-Liegen-
+      vuln → Vorlagen-vuln. Gemeinsame T5-Animationen nur noch für Gon kopiert (>15 %).
+      `tools/t3_req_learn.py`: lernt T3 (cond, req) → T5-Requirement an den 15 gemeinsamen
+      Figuren (Movesets parallel über gleiche Befehle): cond 1/2/3/4/6/8/10/18 und req 39/57 →
+      ohne Bedingung (`FREE_ATTACK`, `REQ_NONE`), req 25 → T5 33 (Abstand). T3-Requirement-
+      Code FUN_8002e0bc: req 1 = Kontakt (+0xD1, Treffer oder Block), 26 = Kontakt und nicht
+      geblockt (On Hit → T5 40), 28 = +0xD2 = letzter aktiver Frame ohne Kontakt (Whiff; T5-ID
+      unbekannt, T5→T7-Tabelle in TKMovesets kennt nur 40 On Hit / 41 On Block), 24 = Zähler
+      +0xF8 ≥ Parameter, 36 = Winkel (Rücken). Abdeckung: Ogre 135/151, Gun Jack 150/213,
+      Gon 90/150, Dr. B 174/243. Zufallseingaben-Test stabil (300 LOGIC/5 s).
       Rest: Moves hinter nicht gepaarten Zuständen (from_unported: Dr. B 53, Gun Jack 33, Gon
       26 – z. B. T3-Liegeschleifen mit Bodenangriffen: Gun Jack 35/36, Gon 114/169, Dr. B 274;
       Gon 101 nach Sprung), tastenlose Übergänge mit Richtung (Gon 25), Bedingungen
