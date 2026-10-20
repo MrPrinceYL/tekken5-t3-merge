@@ -9,6 +9,7 @@ the template attack with the T3 move's animation (retargeted, t3_anim_to_t5), da
 
     python t3_moveset_to_t5.py <t3 model> <costume model file> <out dir> [template slot]
 """
+import math
 import re
 import struct
 import sys
@@ -20,7 +21,9 @@ import t5_bank  # noqa: E402
 from lzpack import pack as lz_pack  # noqa: E402
 from t3_moves import Moveset  # noqa: E402
 from t3_reactions import Mapper, normal_hit, t3_reaction  # noqa: E402
+from t5_anim import scale_floats  # noqa: E402
 from t5_com import CANCEL, HITCOND, Com  # noqa: E402
+from t3_model import f  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -160,6 +163,57 @@ def t3_motions(ms):
     return out
 
 
+def leg_length(skel):
+    """Thigh + shin of a T5 skeleton (nodes 15, 16)."""
+    _, tr, _ = skel
+    return sum(math.sqrt(sum(x * x for x in tr[n])) for n in (15, 16))
+
+
+COMMON_BANK = ROOT / "merge/extracted/tk5data1/0018.bin"   # the 0x8000 + k animations
+
+
+def scale_to_body(m, costume, template_slot, com, anims, n_tpl, t3_anim):
+    """Root and pelvis positions (float bones 0, 1) fitted to the character's size, as T3 does it:
+    T3 scales the root position by the 3DMK size (FUN_80035bc0 -> player +0x4EE, FUN_80038970;
+    Gon 45 %, Dr. B 90 %, Ogre 105 %). Template and common-bank animations scale by leg length
+    (character / template skeleton); common ones are copied into the own bank for that. Throw
+    victim moves (`*_y`) play on the opponent and keep their animations."""
+    size, = struct.unpack_from("<I", f(0x5F + 4 * m), 4)
+    tpl_skel = conv.skeleton_of((ROOT / f"merge/extracted/tk5data1/{230 + 11 * template_slot + 10:04d}.bin").read_bytes())
+    tpl_scale = leg_length(conv.skeleton_of(Path(costume).read_bytes())) / leg_length(tpl_skel)
+    print(f"body scale: T3 size {size} %, template animations x{tpl_scale:.3f}")
+    if abs(tpl_scale - 1) < 1e-3 and size == 100:
+        return anims
+    n = len(com.lists["move"])
+    victim = {com.move(i)["anim"] for i in range(n) if com.name(com.move(i)["name"]).endswith("_y")}
+    own = {i for (_, v), i in t3_anim.items() if i is not None and not v}
+    out = []
+    for i, a in enumerate(anims):
+        s = 1.0 if 0x4000 + i in victim else tpl_scale if i < n_tpl else size / 100 if i in own else 1.0
+        out.append(scale_floats(a, s) if a and abs(s - 1) > 1e-3 else a)
+    common = t5_bank_anims(COMMON_BANK.read_bytes())
+    copied = {}
+    for i in range(n):
+        mv = com.move(i)
+        a = mv["anim"]
+        # 0x8000 = motOrigin: the engine treats it specially (redirected, the fight hung on loading)
+        if a <= 0x8000 or a in victim or not common[a - 0x8000]:
+            continue
+        if a not in copied:
+            copied[a] = 0x4000 + len(out)
+            out.append(scale_floats(common[a - 0x8000], tpl_scale))
+        mv["anim"] = copied[a]
+        com.lists["move"][i] = com.pack_move(mv)
+    print(f"  common animations copied and scaled: {len(copied)}")
+    return out
+
+
+def t5_bank_anims(data):
+    """Animations of a bare bank (no container)."""
+    from t5_anim import bank
+    return bank(data)[1]
+
+
 def build(m, costume, out_dir, template_slot=0):
     ms = Moveset(m)
     attacks = t3_attacks(ms)
@@ -169,6 +223,7 @@ def build(m, costume, out_dir, template_slot=0):
     bank_tpl = tbank.read_bytes()
     _, _, anims = t5_bank.read(bank_tpl)
     anims = list(anims)
+    n_tpl = len(anims)
     skel = conv.skeleton_of(Path(costume).read_bytes())
     victim_skel = conv.skeleton_of((ROOT / "merge/extracted/tk5data1/0240.bin").read_bytes())
     reactions = Mapper(com)
@@ -494,6 +549,7 @@ def build(m, costume, out_dir, template_slot=0):
     with open(out / "clones.txt", "w", encoding="utf-8") as fh:
         for (tm, t3), new in sorted(clones.items(), key=lambda kv: kv[1]):
             fh.write(f"{new} T3-{t3} ({com.name(com.move(tm)['name'])})\n")
+    anims = scale_to_body(m, costume, template_slot, com, anims, n_tpl, t3_anim)
     (out / "moveset.bin").write_bytes(lz_pack(com.build()))
     (out / "bank.bin").write_bytes(t5_bank.build(bank_tpl, anims))
     print(f"T3 attacks {len(attacks)}, new moves {len(clones)}, new animations {len(t3_anim)}, "

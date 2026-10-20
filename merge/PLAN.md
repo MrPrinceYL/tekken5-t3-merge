@@ -9,11 +9,23 @@ neuen Charaktere.
 Ziel (Nutzer): alle fünf 1:1 wie in T3 (Modell, Moveset, Posen, Portrait, Gimmicks …) und
 fehlerfrei in T5. Jede Stufe erst im Spiel prüfen (headless + Bild), dann notieren + committen.
 
-- [ ] **P0 Stand im neuen Build prüfen:** alle fünf auswählbar, Kampf läuft, Grafik ok (je
-      Charakter headless mit `T5_FORCE_SLOT`), offener Test „nur gegen Paul/Jack-5 als P2“.
-- [ ] **P1 Gimmick Gon (nur Gon):** klein (3DMK-Größe 45 % statt 100 %) – Modell und
-      Skelett/Trefferkugeln/Kollision verkleinern, damit hohe Angriffe über ihn gehen wie in T3.
-      T3-Mechanik nachlesen (Tekken3Decomp: wie die Größe Treffer/Wurf beeinflusst).
+- [x] **P0 Stand im neuen Build prüfen (20.10.):** alle fünf im Kampf, Grafik ok, Ogre gegen
+      Paul fehlerfrei. Dabei gefunden + behoben: nur 62 freie TOC-Einträge für 94 Mod-Dateien –
+      44 Kostüm-Unterdateien (Slots 82–88) wurden nie geladen. TOC + Wortsummen jetzt in
+      `merge.rs` nach 0x122000 / 0x126000 kopiert und auf 0x700 Einträge erweitert (11 Patches
+      in den Zugriffsfunktionen 0x23F378/0x23F5C0/0x23FAA8/0x23FCB0, `merge/patches.csv`).
+- [x] **P1 Gimmick Gon (20.10.):** klein wie in T3. T3: 3DMK-Kopf Wort 1 = Größe in %
+      (FUN_80035bc0 → Spieler +0x4EC/+0x4EE), FUN_80038970 skaliert damit die Wurzelposition;
+      Modell-Offsets sind schon klein (Gon-Beine 198 statt Pauls 458). Vorher setzten alle
+      Animationen (T3 unskaliert, Vorlage, gemeinsame T5-Bank) das Becken auf volle Höhe →
+      Gon riesig mit gestreckten Beinen. Jetzt `t3_moveset_to_t5.scale_to_body`: Float-Kanäle
+      Knochen 0/1 (Wurzel, Becken) exakt skaliert (`t5_anim.scale_floats`: Faktor + Grundpose):
+      T3-Animationen × Größe/100, Vorlage × Beinlänge Figur/Vorlage, gemeinsame Bank (TK5DATA1
+      Datei 18, 832 Animationen, Ids 0x8000+k) skaliert in die eigene Bank kopiert. Ausgenommen:
+      Wurf-Opfer-Moves `*_y` (laufen auf dem Gegner) und 0x8000 `motOrigin` (umgebogen hing das
+      Laden des Kampfs). Für alle fünf angewendet (Ogre ×1,04, True Ogre ×0,99, Gun Jack ×0,875
+      gegen Jack-5, Dr. B ×0,86/0,9). Im Fenster geprüft, auch getroffen/am Boden. Treffer-
+      kugeln folgen dem Skelett → hohe Angriffe gehen über Gon (Spieltest Nutzer offen).
 - [ ] **P2 Gimmick Dr. B (nur Dr. B):** kann nicht lange stehen (Rücken) – T3-Stand-Kette
       (Stand → Umfallen/Liegen nach Zeit) und Bodenspiel aus dem T3-Moveset übernehmen.
 - [ ] **P3 Füße verbuggt** (Nutzer 13.10.) – Ursache finden (Skinning/Retargeting/geteilte Ressource).
@@ -26,6 +38,14 @@ fehlerfrei in T5. Jede Stufe erst im Spiel prüfen (headless + Bild), dann notie
       Auswahlbilder zu klein – Gesicht auf Höhe und Größe von Devil Jins Bild verschieben und
       skalieren (Devil Jin = Vorlage). Außerdem stehen die P2-Bilder auf der falschen Seite
       (links statt rechts). Werkzeug `tools/t5_portraits.py`, Quellen `merge/png/t3_to_t5_portraits`.
+
+### Testablauf (20.10.)
+
+Headless lässt sich das Intro-Video im neuen Build nicht überspringen (Fensterbuild schon,
+Ursache offen). Daher Tests im Fenster: `t5-bevy` mit `T5_SHOTS=<ordner>` (ein Bild pro
+Spielsekunde), `T5_WARP=1` (= F3), `T5_HOLD=0.15`, eigene Kopie von `memcard`,
+`T5_FORCE_SLOT=0:<slot>` und `--press START@20 … START@62` alle 1,5 s (überspringt Intro,
+landet im Story-Modus, Auswahl wird erzwungen, Story-Text übersprungen) → Kampf ab ~70 s.
 
 ## Ausgangslage
 

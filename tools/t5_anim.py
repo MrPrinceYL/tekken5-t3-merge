@@ -246,6 +246,26 @@ def encode(values, desc=DESC_T5, sh=0, fsh=0, factors=None, base_float=None):
     return bytes(out)
 
 
+def scale_floats(anim, s, bones=(0, 1), desc=DESC_T5):
+    """The animation with the float (position) channels of `bones` scaled by s: a float value is
+    base + (code << fsh) * factor, so scaling the bone's factor and base pose is exact."""
+    frames, sh, fsh, fb = struct.unpack_from("<HBBH", anim, 0)
+    out = bytearray(anim)
+    p = 2 * ((4 * fb + 6) // 2)
+    fi = 0
+    for j, d in enumerate(desc):
+        if is_short(d):
+            p += 6
+            continue
+        if j in bones:
+            f, = struct.unpack_from("<f", out, 6 + 4 * fi)
+            struct.pack_into("<f", out, 6 + 4 * fi, f * s)
+            struct.pack_into("<3f", out, p, *[v * s for v in struct.unpack_from("<3f", out, p)])
+        p += 12
+        fi += 1
+    return bytes(out)
+
+
 def bank(data):
     """(descriptors, [animation bytes]) of an animation bank."""
     cnt, nb = struct.unpack_from("<HH", data, 2)
