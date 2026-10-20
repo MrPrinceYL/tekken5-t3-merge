@@ -572,6 +572,22 @@ def build(m, costume, out_dir, template_slot=0):
     pairs = {stand: 0}
     n_added = 0
     queue = [stand]
+    t5_groups = {}                                    # T3 group -> (T5 group start, count) / None
+
+    def attack_entry(e):
+        """T5 entry data of one T3 cancel entry if it is an attack this character has:
+        [(key, T3 move, damage, from, to, start, requirement list indices)] or []."""
+        cmd, cond, req, _, tgt, _, fr0, fr1, st = e
+        rqs = t5_reqs(req)
+        if cmd >= 0xC000 or not cmd & 0xF or not cond_ok(cond, ms) or rqs is None:
+            return []
+        pk, idx = ms.resolve(tgt)
+        if pk is not ms.own or idx >= pk.count:
+            return []
+        dmg = pk.move(idx)[5] & 0xFFFF
+        if not pk.move_bytes(idx)[0x2D] or dmg & 0x4000:
+            return []
+        return [(t5_key(cmd), idx, dmg, max(fr0, 1), fr1, max(st, 1), rqs)]
     n_states = 0
     while queue:
         j = queue.pop(0)
@@ -597,16 +613,41 @@ def build(m, costume, out_dir, template_slot=0):
                 continue                      # template attacks: replaced by the T3 list below
             entries.append(struct.pack(CANCEL, *f))
         # the T3 state's attacks, all of them in T3 order with T3's frame windows, in front
+        # (T3's shared groups become T5 group lists, called with 0x8005 like the template's)
+        ref = sample or [0, 0, 0, 0, 1, 255, 1, 0]
         front = []
-        for key, t3idx, dmg, fr0, fr1, st, rq in t3_attack_entries(ms, st3):
-            if rq and rq not in req_list:
-                continue
-            tm = tmpl_of.get(key) or next((v for k, v in tmpl_of.items() if k[1] == key[1]),
-                                          next(iter(tmpl_of.values())))
-            ref = sample or [0, 0, 0, 0, 1, 255, 1, 0]
-            front.append(struct.pack(CANCEL, key[0] | key[1] << 16, req_list.get(rq, 0), clone(tm, t3idx, dmg),
-                                     ref[3], fr0, fr1, st, ref[7]))
-            n_added += 1
+        run, run_gid = [], None
+
+        def flush():
+            if run_gid is None:
+                front.extend(run)
+                return
+            if run_gid not in t5_groups:
+                if not run:
+                    t5_groups[run_gid] = None             # nothing of it for this character
+                    return
+                t5_groups[run_gid] = (len(com.lists["group_cancel"]), len(run))
+                com.lists["group_cancel"].extend(run)
+                com.lists["group_cancel"].append(struct.pack(CANCEL, 0x8006, 0, 0, 0, 0, 0, 0, 0))
+            g = t5_groups[run_gid]
+            if g is not None:
+                front.append(struct.pack(CANCEL, 0x8005, 0, g[0], 0, 0, 0, g[1], 0))
+
+        for _, e, gid in ms.cancels_grouped(ms.own, ms.own.move(st3)[3]):
+            if gid != run_gid:
+                flush()
+                run, run_gid = [], gid
+            if gid is not None and gid in t5_groups:
+                continue                                  # translated once already
+            for key, t3idx, dmg, fr0, fr1, st, rqs in attack_entry(e):
+                tm = tmpl_of.get(key) or next((v for k, v in tmpl_of.items() if k[1] == key[1]),
+                                              next(iter(tmpl_of.values())))
+                child = clone(tm, t3idx, dmg)
+                for rq in rqs:
+                    run.append(struct.pack(CANCEL, key[0] | key[1] << 16, rq, child,
+                                           ref[3], fr0, fr1, st, ref[7]))
+                n_added += 1
+        flush()
         entries = front + entries
         mv = com.move(j)
         mv["cancel"] = len(com.lists["cancel"])

@@ -56,6 +56,27 @@ class Moveset:
         v, = struct.unpack_from("<I", self.own.d, self.own.table + 4 * target)
         return (self.own, v) if v < 0x40000000 else (self.common, v - 0x40000000)
 
+    def cancels_grouped(self, pack, start):
+        """As cancels(), with the group each entry comes from: (kind, entry, group start or None)
+        (a 0xC00C call names the common list 0x80017C78 + s[3] * 12)."""
+        out = []
+        p = pack.cancels + 12 * start
+        while True:
+            e = struct.unpack("<HBBHHBBBB", pack.d[p:p + 12])
+            if e[0] == 0xC000:
+                return out
+            if e[0] == 0xC00C:
+                g = GROUPS + 12 * e[4]
+                while True:
+                    ge = struct.unpack("<HBBHHBBBB", _ram(g, 12))
+                    if ge[0] in (0xC000, 0xC00D):
+                        break
+                    out.append(("group", ge, e[4]))
+                    g += 12
+            else:
+                out.append(("own", e, None))
+            p += 12
+
     def cancels(self, pack, start):
         """Cancel entries from index `start` of `pack` (group references expanded, in order)."""
         out = []

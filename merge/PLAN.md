@@ -89,7 +89,10 @@ fehlerfrei in T5. Jede Stufe erst im Spiel prüfen (headless + Bild), dann notie
       weg). Bedingte Folgeangriffe (Rücken, On Hit) auch für Tasten-/Richtungs-Einträge.
       Abdeckung: Ogre 140/141, True Ogre 146/146, Gun Jack 192/212, Gon 105/149, Dr. B 188/237.
       Zufallseingaben-Test (mit gleichzeitigen Tasten): stabil. **True Ogre 447388 Byte = nur
-      484 unter der Grenze** → als Nächstes Moveset verkleinern.
+      484 unter der Grenze** → verkleinert: T3-Gruppen (0xC00C, gemeinsame Listen 0x80017C78)
+      werden jetzt T5-Gruppenlisten mit 0x8005-Aufruf statt in jede Zustandsliste kopiert
+      (`Moveset.cancels_grouped`, `attack_entry`, `t5_groups`) → True Ogre 424756 Byte, Abdeckung
+      unverändert, Zufallstest stabil.
       Rest (alt): Moves hinter nicht gepaarten Zuständen (from_unported: Dr. B 53, Gun Jack 33, Gon
       26 – z. B. T3-Liegeschleifen mit Bodenangriffen: Gun Jack 35/36, Gon 114/169, Dr. B 274;
       Gon 101 nach Sprung), tastenlose Übergänge mit Richtung (Gon 25), Bedingungen
