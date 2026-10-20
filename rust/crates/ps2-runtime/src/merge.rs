@@ -523,6 +523,20 @@ fn field(e: &[u8; 0x24], off: usize, half: bool) -> u32 {
     }
 }
 
+/// Moveset cache (FUN_00224ce0): both players' moveset / bank buffers are keyed by moveset
+/// character (+0x3E) | the costume flags of FUN_00214c60 (its only caller; 0 or 0x80). A new
+/// character has its template's moveset character, so it gets the slot as an extra flag
+/// (above the 0x80 / 0x100 file-set bits): it never shares its template's buffers, while the
+/// originals keep their keys (King's two costumes share one buffer, King's memory layout).
+pub fn moveset_flags(c: &mut Ctx) -> bool {
+    let slot = rd16(c, c.gpr32(GPR_A0 + 1) + 0x42) as u32;
+    if slot < SLOTS {
+        return false;
+    }
+    c.set_gpr32(GPR_V0, slot << 16);
+    true
+}
+
 /// All slot entries (the original ones from RAM, then the new ones) for the searches.
 fn all_entries(c: &Ctx) -> Vec<[u8; 0x24]> {
     let mut v = Vec::new();

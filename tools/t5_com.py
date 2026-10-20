@@ -78,6 +78,114 @@ class Com:
             return "?"
         return self.strings[o:self.strings.index(b"\0", o)].decode("latin1")
 
+    def reachable_moves(self):
+        """Moves the game can reach: the 36 aliases, cancel and group-cancel targets, transitions
+        and reaction moves (ids 0x8000 + n are aliases), followed transitively."""
+        n = len(self.lists["move"])
+        aliases = struct.unpack_from("<36I", self.head, 0x18)
+
+        def real(x):
+            x = aliases[x - 0x8000] if 0x8000 <= x < 0x8000 + 36 else x
+            return x if x < n else None
+
+        group = [struct.unpack(CANCEL, e) for e in self.lists["group_cancel"]]
+        seen = set()
+        todo = [real(a) for a in aliases]
+        for e in self.lists["reactions"]:
+            todo += [real(x) for x in struct.unpack_from("<14H", e, 52)]
+        while todo:
+            i = todo.pop()
+            if i is None or i in seen:
+                continue
+            seen.add(i)
+            m = self.move(i)
+            todo.append(real(m["transition"]))
+            k = m["cancel"]
+            while True:
+                f = struct.unpack(CANCEL, self.lists["cancel"][k])
+                if f[0] == 0x8005:
+                    g = f[2]
+                    while group[g][0] != 0x8006:
+                        todo.append(real(group[g][2]))
+                        g += 1
+                else:
+                    todo.append(real(f[2]))
+                if f[0] == 0x8000:
+                    break
+                k += 1
+        return seen
+
+    def drop_dead_cancel_lists(self):
+        """Unreachable moves keep their index but share the list of alias 1 (standing): their own
+        cancel lists can then be compacted away."""
+        live = self.reachable_moves()
+        stand = self.move(struct.unpack_from("<I", self.head, 0x18 + 4)[0])["cancel"]
+        for i in range(len(self.lists["move"])):
+            if i not in live:
+                m = self.move(i)
+                m["cancel"] = stand
+                self.lists["move"][i] = self.pack_move(m)
+        return len(self.lists["move"]) - len(live)
+
+    def remove_dead_moves(self):
+        """Drop the moves the game cannot reach (reachable_moves) and renumber every move
+        reference: both alias blocks of the header, cancel / group-cancel targets (not the group
+        index of 0x8005), end-entry targets, transitions, reaction moves. A leftover reference to
+        a dropped move (only from unreachable lists) goes to standing (alias 1)."""
+        n = len(self.lists["move"])
+        live = sorted(self.reachable_moves())
+        new = {old: k for k, old in enumerate(live)}
+        stand = new[struct.unpack_from("<I", self.head, 0x18 + 4)[0]]
+
+        def ren(x):
+            return new.get(x, stand) if x < n else x            # 0x8000 + n: aliases stay
+
+        for blk in (0x18, 0x18 + 36 * 4):
+            al = list(struct.unpack_from("<36I", self.head, blk))
+            struct.pack_into("<36I", self.head, blk, *[ren(x) for x in al])
+        for name in ("cancel", "group_cancel"):
+            out = []
+            for e in self.lists[name]:
+                f = list(struct.unpack(CANCEL, e))
+                if f[0] != 0x8005:
+                    f[2] = ren(f[2])
+                out.append(struct.pack(CANCEL, *f))
+            self.lists[name] = out
+        for k, e in enumerate(self.lists["reactions"]):
+            b = bytearray(e)
+            mv = struct.unpack_from("<14H", b, 52)
+            struct.pack_into("<14H", b, 52, *[ren(x) for x in mv])
+            self.lists["reactions"][k] = bytes(b)
+        moves = []
+        for old in live:
+            m = self.move(old)
+            m["transition"] = ren(m["transition"])
+            moves.append(self.pack_move(m))
+        self.lists["move"] = moves
+        return n - len(live)
+
+    def compact_cancels(self):
+        """Keep only the cancel lists moves start (each up to its 0x8000 end entry) and share
+        identical ones; the converter's clones leave the replaced template lists behind. Moves
+        are the only references into the cancel list (groups have their own list)."""
+        lists, at, out = {}, {}, []
+        for i in range(len(self.lists["move"])):
+            m = self.move(i)
+            s = m["cancel"]
+            if s not in at:
+                k = s
+                while struct.unpack_from("<I", self.lists["cancel"][k])[0] != 0x8000:
+                    k += 1
+                body = tuple(self.lists["cancel"][s:k + 1])
+                if body not in lists:
+                    lists[body] = len(out)
+                    out.extend(body)
+                at[s] = lists[body]
+            if m["cancel"] != at[s]:
+                m["cancel"] = at[s]
+                self.lists["move"][i] = self.pack_move(m)
+        self.lists["cancel"] = out
+
     def build(self):
         out = bytearray(self.head) + self.strings
         tab = {}

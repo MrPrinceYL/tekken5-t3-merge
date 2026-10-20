@@ -31,3 +31,5 @@ main,0x0025F450,merge_container_count
 main,0x0025F428,merge_container_entry
 main,0x0025F458,merge_container_size
 main,0x002190E0,merge_slot_f12
+
+main,0x00214C60,merge_moveset_flags

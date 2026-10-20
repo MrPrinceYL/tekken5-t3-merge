@@ -236,6 +236,20 @@ def gon_always_low(com):
     print(f"Gon: {n} standing vulnerabilities made low")
 
 
+def drop_unused_animations(com, anims):
+    """Only the own-bank animations (ids 0x4000 + k) that moves still use, renumbered: the
+    template's replaced ones and those of dropped moves cost bank memory."""
+    used = sorted({com.move(i)["anim"] - 0x4000 for i in range(len(com.lists["move"]))
+                   if 0x4000 <= com.move(i)["anim"] < 0x8000})
+    new = {k: n for n, k in enumerate(used)}
+    for i in range(len(com.lists["move"])):
+        mv = com.move(i)
+        if 0x4000 <= mv["anim"] < 0x8000:
+            mv["anim"] = 0x4000 + new[mv["anim"] - 0x4000]
+            com.lists["move"][i] = com.pack_move(mv)
+    return [anims[k] for k in used]
+
+
 def build(m, costume, out_dir, template_slot=0):
     ms = Moveset(m)
     attacks = t3_attacks(ms)
@@ -618,8 +632,22 @@ def build(m, costume, out_dir, template_slot=0):
     anims = scale_to_body(m, costume, template_slot, com, anims, n_tpl, t3_anim)
     if m in GON_MODELS:
         gon_always_low(com)
-    (out / "moveset.bin").write_bytes(lz_pack(com.build()))
-    (out / "bank.bin").write_bytes(t5_bank.build(bank_tpl, anims))
+    # the game keeps both players' movesets in 938368 bytes: the second buffer has 425472
+    # (FUN_00101310 table 0x14D350; only King's gets more). Drop the template moves the clones
+    # replaced and their cancel lists (indices in states.txt / clones.txt are from before this).
+    dead = com.remove_dead_moves()
+    com.compact_cancels()
+    anims = drop_unused_animations(com, anims)
+    raw = com.build()
+    print(f"moveset: {len(raw)} bytes after dropping {dead} unreachable moves")
+    assert len(raw) <= 425472, "moveset larger than the second player's buffer"
+    (out / "moveset.bin").write_bytes(lz_pack(raw))
+    bank = t5_bank.build(bank_tpl, anims)
+    print(f"bank: {len(bank)} bytes")
+    # merge/data/ram.csv splits the banks' 5041856 bytes so that every character but King gets
+    # 2141120 on either side
+    assert len(bank) <= 2141120, "animation bank larger than a player's bank area"
+    (out / "bank.bin").write_bytes(bank)
     print(f"T3 attacks {len(attacks)}, new moves {len(clones)}, new animations {len(t3_anim)}, "
           f"redirected cancels {redirected}, motions {moved}, throw sides {n_throws}, states {n_states}, "
           f"win poses {n_wins} from T3 {wins}")

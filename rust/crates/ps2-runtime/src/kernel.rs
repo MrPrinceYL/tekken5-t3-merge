@@ -1326,6 +1326,7 @@ pub fn hle(c: &mut Ctx, addr: u32) -> bool {
             false
         }
         "merge_file_index" => crate::merge::file_index(c),
+        "merge_moveset_flags" => crate::merge::moveset_flags(c),
         n if n.starts_with("merge_slot") || n.starts_with("merge_find") || n.starts_with("merge_name")
             || n.starts_with("merge_char") || n.starts_with("merge_ptable") || n.starts_with("merge_container")
             || n == "merge_select_result" => {

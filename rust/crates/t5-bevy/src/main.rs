@@ -221,6 +221,12 @@ fn shot(w: u32, h: u32, rgba: &[u8]) {
     if LAST.swap(sec, std::sync::atomic::Ordering::Relaxed) != sec {
         let _ = std::fs::create_dir_all(dir);
         let _ = t5_recomp::write_png(&format!("{dir}/shot_{sec:04}.png"), w, h, rgba);
+        // T5_RAMSNAP=<s1>,<s2>,... (with T5_SHOTS): EE RAM dumps at those seconds, as t5-headless.
+        if let Ok(v) = std::env::var("T5_RAMSNAP") {
+            if v.split(',').any(|x| x.trim().parse::<u64>().ok() == Some(sec)) {
+                let _ = std::fs::write(format!("{dir}/ram_{sec:03}.bin"), &ps2_runtime::machine().ram[..32 << 20]);
+            }
+        }
     }
 }
 

@@ -54,6 +54,39 @@ fehlerfrei in T5. Jede Stufe erst im Spiel prüfen (headless + Bild), dann notie
       teils verdreht (Rundenbeginn). Nutzer fragen, ob es nach dem TOC-Fix (Kostüm-Unter-
       dateien) noch auftritt und wo genau.
 
+### Absturz/Schwarzbild bei Gon / Dr. B (Nutzer 20.10.) – Ursache und Stand
+
+Reproduziert: Gon gegen Slot 3 (`T5_FORCE_SLOT=0:86,1:3`, Arcade) → Hänger beim Laden
+(FUN_0027eb60 läuft eine Requirement-Liste mit Müllzeiger 0x04010401 ab), je nach Gegner
+Absturz. Das Auswahl-Knöpfchen war Zufall (der CPU-Gegner ist zufällig).
+Ursache: Speicherkarte des Spiels (FUN_00101310, Tabelle 0x14D350 = {3, 0x67E00, 0x7D380, 3,
+0x1B3B40, 0x31B380}; FUN_00224ce0). Movesets (COM) beider Spieler teilen 938368 Byte ab
+0x155A980, Animationsbänke 5041856 Byte ab 0x163FB00 (bis 0x1B0E9C0). P2 liegt bei Basis +
+Tabelle[1|2] bzw. [4|5]; Tabelle[1]/[4] gilt, wenn der Cache-Schlüssel des zweiten Puffers
+(DAT_00156158 & 0x7F) = 3 ist (Moveset-Figur 3 = King, größtes Moveset 490484 / Bank 2900624).
+Normal: P2-COM 425472, P2-Bank 1784640 Byte. Unsere Dateien waren größer (COM 439–480 KB,
+Bänke bis 2,25 MB) → überschrieben den anderen Spieler. Dazu verbog der alte Patch „Cache-
+Schlüssel = Slot (+0x42)“ den King-Vergleich (Slot 3 löste ihn aus; King 7/8 als P2 nicht).
+Behoben (Commits 20.10.):
+- Konverter: tote Vorlagen-Moves entfernt + alle Move-Verweise umnummeriert
+  (`t5_com.reachable_moves/remove_dead_moves`), Abbruchlisten verdichtet (`compact_cancels`),
+  unbenutzte Animationen aus der Bank (`drop_unused_animations`); Asserts COM ≤ 425472,
+  Bank ≤ 2141120. Jetzt: COM 370–416 KB, Bänke 1,81–1,93 MB.
+- `merge/data/ram.csv`: Bank-Aufteilung Tabelle[4] = 0x20AC00, [5] = 0x2C4300 → King passt auf
+  beiden Seiten, alle anderen bekommen bis 2141120 Byte (COM-Aufteilung bleibt original).
+- Cache-Schlüssel wieder original (+0x3E, die 6 `lh 0x42`-Patches entfernt; King 7 gegen 8
+  teilte sonst nicht → zwei King-Bänke passen nicht → Hänger). Stattdessen Hook
+  `merge_moveset_flags` auf FUN_00214c60 (einziger Aufrufer FUN_00224ce0): neue Slots bekommen
+  `slot << 16` als Zusatz-Flag → nie geteilter Puffer mit der Vorlage („nur gegen Paul“ bleibt
+  behoben).
+- Diagnose: `T5_RESLOG=1` (Ressourcen-Anfragen), `T5_WATCHFN`, `T5_RAMSNAP` jetzt auch im
+  Fensterbuild (mit `T5_SHOTS`). Prüfskripte (Requirement-/Struktur-Check der COM) lagen im
+  Scratchpad; bei Bedarf als tools/ übernehmen.
+Geprüft (vor dem letzten Schritt, mit Slot-Schlüssel): Gon–Slot 3, Dr. B–Slot 3, King–Gon,
+Gun Jack–King, King–Dr. B, Dr. B–True Ogre im Kampf ok. **Der letzte Schritt (Schlüssel
+original + Flag-Hook) ist gebaut, aber noch NICHT getestet** → als Erstes: King 7 gegen 8,
+Gon gegen Paul (0), Gun Jack gegen Jack-5 (47), Gon gegen Slot 3, Dr. B gegen King.
+
 ### Testablauf (20.10.)
 
 Headless lässt sich das Intro-Video im neuen Build nicht überspringen (Fensterbuild schon,
