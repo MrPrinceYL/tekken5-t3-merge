@@ -217,7 +217,16 @@ fn shot(w: u32, h: u32, rgba: &[u8]) {
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
     static DIR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     let Some(dir) = DIR.get_or_init(|| std::env::var("T5_SHOTS").ok()) else { return };
-    let sec = ps2_runtime::secs() as u64;
+    let now = ps2_runtime::secs();
+    // T5_SHOTS_FROM / T5_SHOTS_TO (seconds): every picture in that span, for looking at moves
+    let span = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<f64>().ok());
+    if let (Some(a), Some(b)) = (span("T5_SHOTS_FROM"), span("T5_SHOTS_TO")) {
+        if now >= a && now <= b {
+            let _ = std::fs::create_dir_all(dir);
+            let _ = t5_recomp::write_png(&format!("{dir}/fine_{:06}.png", (now * 1000.0) as u64), w, h, rgba);
+        }
+    }
+    let sec = now as u64;
     if LAST.swap(sec, std::sync::atomic::Ordering::Relaxed) != sec {
         let _ = std::fs::create_dir_all(dir);
         let _ = t5_recomp::write_png(&format!("{dir}/shot_{sec:04}.png"), w, h, rgba);

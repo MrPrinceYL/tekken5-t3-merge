@@ -70,6 +70,16 @@ def t3_sequence(cmd):
         q += 2
 
 
+def t5_command(key):
+    """T5 cancel command of a (direction mask, buttons) key: button commands carry flag 0x20 in
+    the top byte like all of the template's (Paul's standing list: 0x20090040 = f+1+4);
+    special commands (sequences 0x8013.., dashes) and direction-only ones have none."""
+    d, btn = key
+    if btn and d < 0x8000:
+        return 0x20 << 24 | btn << 16 | d
+    return d | btn << 16
+
+
 def t3_character(m):
     """T3 character id of model m (table 0x800958C4: four model slots per character, m + 6)."""
     from t3_anim import _ram
@@ -441,6 +451,7 @@ def build(m, costume, out_dir, template_slot=0):
         return [req_list[x] for x in t5]
 
     follow_groups = {}                                # T3 group -> (T5 group start, count) / None
+    tail_groups = {}                                  # template entries without buttons -> group
 
     def follow_entry(e, tmove):
         """T5 entries for one T3 cancel entry of a ported move's list (strings, automatic and
@@ -552,6 +563,7 @@ def build(m, costume, out_dir, template_slot=0):
             elif lying_template(nxt[0]) is not None:      # knocked down: T3's lying loop
                 follow = clone(lying_template(nxt[0]), *nxt)
         length = ms.own.anim_frames(t3idx, ms.common)
+        tail = []
         for e in com.lists["cancel"][mv["cancel"]:]:
             f = list(struct.unpack(CANCEL, e))
             if f[0] == 0x8000:
@@ -561,11 +573,22 @@ def build(m, costume, out_dir, template_slot=0):
                     mv["transition"] = follow
                 entries.append(struct.pack(CANCEL, *f))
                 break
-            # of the template's own entries only the special commands stay (0x8001.. dash,
-            # sidestep, groups ...): its direction-only and automatic (on hit ...) transitions
-            # are the template move's, T3's own are above
-            if 0x8000 < f[0] < 0x10000:
-                entries.append(e)
+            # the template's entries without buttons stay behind T3's own: they carry generic
+            # engine behaviour (e.g. requirement 140, 3394 times in Paul's moveset: hit while
+            # airborne), dropping them broke the moves (user 21.10.)
+            if not (f[0] >> 16) & 0xFF:
+                if f[0] == 0x8005:
+                    entries.append(e)                 # group calls stay calls (no nesting)
+                else:
+                    tail.append(e)
+        if tail:                                      # shared per template move: one group
+            key_t = tuple(tail)
+            if key_t not in tail_groups:
+                tail_groups[key_t] = len(com.lists["group_cancel"])
+                com.lists["group_cancel"].extend(tail)
+                com.lists["group_cancel"].append(struct.pack(CANCEL, 0x8006, 0, 0, 0, 0, 0, 0, 0))
+            entries.insert(len(entries) - 1, struct.pack(CANCEL, 0x8005, 0, tail_groups[key_t],
+                                                         0, 0, 0, len(tail), 0))
         start = len(com.lists["cancel"])
         com.lists["cancel"].extend(entries)
         mv["cancel"] = start
@@ -766,9 +789,11 @@ def build(m, costume, out_dir, template_slot=0):
                 com.lists["group_cancel"].extend(run)
                 com.lists["group_cancel"].append(struct.pack(CANCEL, 0x8006, 0, 0, 0, 0, 0, 0, 0))
             g = t5_groups[run_gid]
-            if g is not None:
+            if g is not None and g[0] not in called:  # each group once per list
+                called.add(g[0])
                 front.append(struct.pack(CANCEL, 0x8005, 0, g[0], 0, 0, 0, g[1], 0))
 
+        called = set()
         state_entries = []
         for s3 in state_moves(j, st3):
             state_entries += ms.cancels_grouped(ms.own, ms.own.move(s3)[3])
@@ -786,7 +811,7 @@ def build(m, costume, out_dir, template_slot=0):
                     tm = lying_template(t3idx) or stand    # stance changes, rolls ...
                 child = clone(tm, t3idx, dmg)
                 for rq in rqs:
-                    run.append(struct.pack(CANCEL, key[0] | key[1] << 16, rq, child,
+                    run.append(struct.pack(CANCEL, t5_command(key), rq, child,
                                            ref[3], fr0, fr1, st, ref[7]))
                 n_added += 1
         flush()
@@ -1056,7 +1081,7 @@ def build(m, costume, out_dir, template_slot=0):
                     continue
                 at = throw_attempt(idx)
                 for rq in rqs:
-                    front.append(struct.pack(CANCEL, key[0] | key[1] << 16, rq, at, 0,
+                    front.append(struct.pack(CANCEL, t5_command(key), rq, at, 0,
                                              max(fr0, 1), fr1, max(st, 1), 0))
             if front:
                 mv = com.move(j)
